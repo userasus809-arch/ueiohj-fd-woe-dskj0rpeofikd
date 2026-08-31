@@ -245,6 +245,67 @@ func TestBotCommandsRejectUnsupportedScopeAndLanguage(t *testing.T) {
 	}
 }
 
+func TestBotProfileNameDescriptionShortDescriptionRoundTrip(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	h := (&handler{bots: bots}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "setMyName", `{"name":"Gram Helper"}`)
+	if rec.Code != http.StatusOK || bots.name != "Gram Helper" {
+		t.Fatalf("setMyName status=%d body=%s name=%q", rec.Code, rec.Body.String(), bots.name)
+	}
+	rec = performBotAPIRequest(t, h, bots.profile, "setMyDescription", `{"description":"Full description"}`)
+	if rec.Code != http.StatusOK || bots.description != "Full description" {
+		t.Fatalf("setMyDescription status=%d body=%s description=%q", rec.Code, rec.Body.String(), bots.description)
+	}
+	rec = performBotAPIRequest(t, h, bots.profile, "setMyShortDescription", `{"short_description":"Short blurb"}`)
+	if rec.Code != http.StatusOK || bots.about != "Short blurb" {
+		t.Fatalf("setMyShortDescription status=%d body=%s about=%q", rec.Code, rec.Body.String(), bots.about)
+	}
+
+	for _, tc := range []struct {
+		method string
+		field  string
+		want   string
+	}{
+		{"getMyName", "name", "Gram Helper"},
+		{"getMyDescription", "description", "Full description"},
+		{"getMyShortDescription", "short_description", "Short blurb"},
+	} {
+		rec := performBotAPIRequest(t, h, bots.profile, tc.method, `{}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", tc.method, rec.Code, rec.Body.String())
+		}
+		var response struct {
+			OK     bool           `json:"ok"`
+			Result map[string]any `json:"result"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("%s decode response: %v", tc.method, err)
+		}
+		if !response.OK || response.Result[tc.field] != tc.want {
+			t.Fatalf("%s response=%s", tc.method, rec.Body.String())
+		}
+	}
+}
+
+func TestBotProfileMethodsRejectLanguageCode(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	h := (&handler{bots: bots}).routes()
+
+	for _, method := range []string{
+		"setMyName", "getMyName",
+		"setMyDescription", "getMyDescription",
+		"setMyShortDescription", "getMyShortDescription",
+	} {
+		t.Run(method, func(t *testing.T) {
+			rec := performBotAPIRequest(t, h, bots.profile, method, `{"language_code":"en","name":"x","description":"x","short_description":"x"}`)
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "LANGUAGE_CODE_UNSUPPORTED") {
+				t.Fatalf("%s status=%d body=%s", method, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestGetUpdatesProjectsIncomingPrivateText(t *testing.T) {
 	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
 	gateway := &fakeBotAPIGateway{
@@ -1406,8 +1467,11 @@ type apiResponse struct {
 }
 
 type fakeBotAPIBots struct {
-	profile  domain.BotProfile
-	commands []domain.BotCommand
+	profile     domain.BotProfile
+	commands    []domain.BotCommand
+	name        string
+	about       string
+	description string
 }
 
 func (f *fakeBotAPIBots) BotInfo(context.Context, int64) (domain.BotProfile, bool, error) {
@@ -1433,6 +1497,23 @@ func (f *fakeBotAPIBots) GetBotMenuButton(context.Context, int64) (domain.BotMen
 
 func (f *fakeBotAPIBots) BotEmojiStatusPermission(context.Context, int64, int64) (bool, error) {
 	return true, nil
+}
+
+func (f *fakeBotAPIBots) SetBotInfo(_ context.Context, _ int64, upd domain.BotInfoUpdate) (int, error) {
+	if upd.SetName {
+		f.name = upd.Name
+	}
+	if upd.SetAbout {
+		f.about = upd.About
+	}
+	if upd.SetDescription {
+		f.description = upd.Description
+	}
+	return 1, nil
+}
+
+func (f *fakeBotAPIBots) GetBotInfo(context.Context, int64) (string, string, string, error) {
+	return f.name, f.about, f.description, nil
 }
 
 type fakeWebAppService struct {

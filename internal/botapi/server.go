@@ -28,6 +28,10 @@ type BotsService interface {
 	SetBotMenuButton(ctx context.Context, botUserID int64, button domain.BotMenuButton) (int, error)
 	GetBotMenuButton(ctx context.Context, botUserID int64) (domain.BotMenuButton, error)
 	BotEmojiStatusPermission(ctx context.Context, botUserID, userID int64) (bool, error)
+	// SetBotInfo/GetBotInfo back setMyName/setMyDescription/setMyShortDescription
+	// and their getters (name=first_name, about=short_description, description=description).
+	SetBotInfo(ctx context.Context, botUserID int64, upd domain.BotInfoUpdate) (int, error)
+	GetBotInfo(ctx context.Context, botUserID int64) (name, about, description string, err error)
 }
 
 type UsersService interface {
@@ -217,6 +221,18 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.deleteMyCommands(w, r, botID)
 	case "getmycommands":
 		h.getMyCommands(w, r, botID)
+	case "setmyname":
+		h.setMyName(w, r, botID)
+	case "getmyname":
+		h.getMyName(w, r, botID)
+	case "setmydescription":
+		h.setMyDescription(w, r, botID)
+	case "getmydescription":
+		h.getMyDescription(w, r, botID)
+	case "setmyshortdescription":
+		h.setMyShortDescription(w, r, botID)
+	case "getmyshortdescription":
+		h.getMyShortDescription(w, r, botID)
 	case "getupdates":
 		h.getUpdates(w, r, botID)
 	case "sendmessage":
