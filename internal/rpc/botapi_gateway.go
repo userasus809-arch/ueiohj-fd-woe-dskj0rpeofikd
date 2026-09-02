@@ -1160,3 +1160,124 @@ func (r *Router) BotAPIGetFile(ctx context.Context, botID int64, locationKey str
 		Limit:       limit,
 	})
 }
+
+// botAPIChatActionToUpdate maps a Bot API sendChatAction string onto the
+// same TL SendMessageActionClass values messages.setTyping already pushes,
+// so bot- and user-originated typing indicators render identically on the
+// client. The caller has already validated action against the official
+// Bot API value set.
+func botAPIChatActionToUpdate(action string) tg.SendMessageActionClass {
+	switch action {
+	case "typing":
+		return &tg.SendMessageTypingAction{}
+	case "upload_photo":
+		return &tg.SendMessageUploadPhotoAction{}
+	case "record_video":
+		return &tg.SendMessageRecordVideoAction{}
+	case "upload_video":
+		return &tg.SendMessageUploadVideoAction{}
+	case "record_voice":
+		return &tg.SendMessageRecordAudioAction{}
+	case "upload_voice":
+		return &tg.SendMessageUploadAudioAction{}
+	case "upload_document":
+		return &tg.SendMessageUploadDocumentAction{}
+	case "choose_sticker":
+		return &tg.SendMessageChooseStickerAction{}
+	case "find_location":
+		return &tg.SendMessageGeoLocationAction{}
+	case "record_video_note":
+		return &tg.SendMessageRecordRoundAction{}
+	case "upload_video_note":
+		return &tg.SendMessageUploadRoundAction{}
+	default:
+		return &tg.SendMessageCancelAction{}
+	}
+}
+
+// BotAPISendChatAction pushes a transient typing/uploading indicator through
+// the same private- and channel-fanout paths as messages.setTyping. Like the
+// MTProto method it mirrors, this is fire-and-forget: the Bot API contract
+// for sendChatAction never reports a missed delivery to the caller.
+func (r *Router) BotAPISendChatAction(ctx context.Context, botID, chatID int64, action string) (bool, error) {
+	if r == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIPeerFromChatID(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	tgAction := botAPIChatActionToUpdate(action)
+	if peer.Type == domain.PeerTypeChannel {
+		if r.deps.Channels == nil {
+			return true, nil
+		}
+		updates := &tg.Updates{
+			Updates: []tg.UpdateClass{&tg.UpdateChannelUserTyping{
+				ChannelID: peer.ID,
+				FromID:    &tg.PeerUser{UserID: botID},
+				Action:    tgAction,
+			}},
+			Date: int(r.clock.Now().Unix()),
+		}
+		r.pushChannelViewerUpdates(ctx, botID, peer.ID, nil, func(int64) *tg.Updates { return updates })
+		return true, nil
+	}
+	update := &tg.UpdateUserTyping{UserID: botID, Action: tgAction}
+	updates := &tg.UpdateShort{Update: update, Date: int(r.clock.Now().Unix())}
+	r.pushTypingUpdate(ctx, peer.ID, updates)
+	return true, nil
+}
+
+// BotAPIGetChat backs the getChat method: a minimal, protocol-neutral
+// projection of a private chat's user or a channel/supergroup's public
+// fields, reusing the existing Users/Channels lookups (and their access
+// checks) rather than duplicating chat-resolution logic.
+func (r *Router) BotAPIGetChat(ctx context.Context, botID, chatID int64) (domain.BotAPIChatInfo, error) {
+	if r == nil || botID == 0 {
+		return domain.BotAPIChatInfo{}, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIPeerFromChatID(chatID)
+	if !ok {
+		return domain.BotAPIChatInfo{}, errors.New("CHAT_ID_INVALID")
+	}
+	if peer.Type == domain.PeerTypeChannel {
+		if r.deps.Channels == nil {
+			return domain.BotAPIChatInfo{}, errors.New("CHAT_ID_INVALID")
+		}
+		view, err := r.deps.Channels.GetChannel(ctx, botID, peer.ID)
+		if err != nil {
+			return domain.BotAPIChatInfo{}, err
+		}
+		if view.Forbidden {
+			return domain.BotAPIChatInfo{}, errors.New("CHAT_ID_INVALID")
+		}
+		chatType := "supergroup"
+		if view.Channel.Broadcast {
+			chatType = "channel"
+		}
+		return domain.BotAPIChatInfo{
+			ID:       chatID,
+			Type:     chatType,
+			Title:    view.Channel.Title,
+			Username: view.Channel.Username,
+		}, nil
+	}
+	if r.deps.Users == nil {
+		return domain.BotAPIChatInfo{}, errors.New("CHAT_ID_INVALID")
+	}
+	user, found, err := r.deps.Users.ByID(ctx, botID, peer.ID)
+	if err != nil {
+		return domain.BotAPIChatInfo{}, err
+	}
+	if !found {
+		return domain.BotAPIChatInfo{}, errors.New("CHAT_ID_INVALID")
+	}
+	return domain.BotAPIChatInfo{
+		ID:        chatID,
+		Type:      "private",
+		Username:  user.Username,
+		FirstName: user.FirstName,
+		LastName:  user.LastName,
+	}, nil
+}

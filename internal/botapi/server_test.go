@@ -306,6 +306,61 @@ func TestBotProfileMethodsRejectLanguageCode(t *testing.T) {
 	}
 }
 
+func TestSendChatActionValidatesAndForwardsToGateway(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "sendChatAction", `{"chat_id":2002,"action":"typing"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.chatActionCalled || gateway.chatActionBotID != 1001 ||
+		gateway.chatActionChatID != 2002 || gateway.chatActionValue != "typing" {
+		t.Fatalf("chat action call = %#v", gateway)
+	}
+
+	gateway2 := &fakeBotAPIGateway{}
+	h2 := (&handler{bots: bots, gateway: gateway2}).routes()
+	rec = performBotAPIRequest(t, h2, bots.profile, "sendChatAction", `{"chat_id":2002,"action":"not_a_real_action"}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "CHAT_ACTION_INVALID") {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if gateway2.chatActionCalled {
+		t.Fatalf("gateway should not be called for an invalid action")
+	}
+}
+
+func TestGetChatReturnsProjectedFields(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{getChatResult: domain.BotAPIChatInfo{
+		ID: 2002, Type: "private", FirstName: "Ada", Username: "ada",
+	}}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "getChat", `{"chat_id":2002}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.getChatCalled || gateway.getChatBotID != 1001 || gateway.getChatChatID != 2002 {
+		t.Fatalf("get chat call = %#v", gateway)
+	}
+	var response struct {
+		OK     bool           `json:"ok"`
+		Result map[string]any `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.OK || response.Result["type"] != "private" ||
+		response.Result["first_name"] != "Ada" || response.Result["username"] != "ada" {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+	if _, hasTitle := response.Result["title"]; hasTitle {
+		t.Fatalf("private chat response should omit empty title: %s", rec.Body.String())
+	}
+}
+
 func TestGetUpdatesProjectsIncomingPrivateText(t *testing.T) {
 	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
 	gateway := &fakeBotAPIGateway{
@@ -1613,6 +1668,18 @@ type fakeBotAPIGateway struct {
 	premiumGiftMessage       domain.PremiumGiftMessage
 	premiumGiftRequestID     string
 	premiumGiftResult        bool
+
+	chatActionCalled bool
+	chatActionBotID  int64
+	chatActionChatID int64
+	chatActionValue  string
+	chatActionErr    error
+
+	getChatCalled bool
+	getChatBotID  int64
+	getChatChatID int64
+	getChatResult domain.BotAPIChatInfo
+	getChatErr    error
 }
 
 func (f *fakeBotAPIGateway) BotAPIGiftPremiumSubscription(
@@ -1792,6 +1859,27 @@ func (f *fakeBotAPIGateway) BotAPIGetFile(_ context.Context, _ int64, locationKe
 	out := chunk
 	out.Bytes = append([]byte(nil), chunk.Bytes[offset:end]...)
 	return out, true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPISendChatAction(_ context.Context, botID, chatID int64, action string) (bool, error) {
+	f.chatActionCalled = true
+	f.chatActionBotID = botID
+	f.chatActionChatID = chatID
+	f.chatActionValue = action
+	if f.chatActionErr != nil {
+		return false, f.chatActionErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIGetChat(_ context.Context, botID, chatID int64) (domain.BotAPIChatInfo, error) {
+	f.getChatCalled = true
+	f.getChatBotID = botID
+	f.getChatChatID = chatID
+	if f.getChatErr != nil {
+		return domain.BotAPIChatInfo{}, f.getChatErr
+	}
+	return f.getChatResult, nil
 }
 
 func (f *fakeBotAPIGateway) BotAPISendEphemeral(_ context.Context, input domain.BotAPIEphemeralSendInput) (domain.EphemeralMessage, error) {

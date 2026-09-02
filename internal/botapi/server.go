@@ -56,6 +56,12 @@ type GatewayService interface {
 	BotAPIDeleteMessage(ctx context.Context, botID, chatID int64, messageID int) (bool, error)
 	BotAPIAnswerCallbackQuery(ctx context.Context, botID int64, callbackQueryID, text, url string, showAlert bool, cacheTime int) (bool, error)
 	BotAPIGetFile(ctx context.Context, botID int64, locationKey string, offset int64, limit int) (domain.FileChunk, bool, error)
+	// BotAPISendChatAction backs the sendChatAction method (typing/uploading
+	// indicators). It is fire-and-forget: a transient push that is never
+	// durably logged, matching real Telegram's behavior for this method.
+	BotAPISendChatAction(ctx context.Context, botID, chatID int64, action string) (bool, error)
+	// BotAPIGetChat backs the getChat method.
+	BotAPIGetChat(ctx context.Context, botID, chatID int64) (domain.BotAPIChatInfo, error)
 }
 
 type EphemeralGatewayService interface {
@@ -263,6 +269,10 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.sendEphemeralLocation(w, r, botID, false)
 	case "sendvenue":
 		h.sendEphemeralLocation(w, r, botID, true)
+	case "sendchataction":
+		h.sendChatAction(w, r, botID)
+	case "getchat":
+		h.getChat(w, r, botID)
 	case "editmessagetext":
 		h.editMessageText(w, r, botID)
 	case "deletemessage":
