@@ -361,6 +361,137 @@ func TestGetChatReturnsProjectedFields(t *testing.T) {
 	}
 }
 
+func TestExportChatInviteLinkReturnsBareLinkString(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{exportInviteResult: "https://t.me/+abc123"}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "exportChatInviteLink", `{"chat_id":-1002000000000}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.exportInviteCalled || gateway.exportInviteChatID != -1002000000000 {
+		t.Fatalf("export invite call = %#v", gateway)
+	}
+	var response struct {
+		OK     bool   `json:"ok"`
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.OK || response.Result != "https://t.me/+abc123" {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+}
+
+func TestCreateChatInviteLinkParsesOptionalFields(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{createInviteResult: domain.BotAPIChatInviteLink{
+		InviteLink: "https://t.me/+xyz789", Name: "Marketing", MemberLimit: 50, CreatorUserID: 1001,
+	}}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	body := `{"chat_id":-1002000000000,"name":"Marketing","member_limit":50,"creates_join_request":false}`
+	rec := performBotAPIRequest(t, h, bots.profile, "createChatInviteLink", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.createInviteCalled ||
+		!gateway.createInviteParams.HasName || gateway.createInviteParams.Name != "Marketing" ||
+		!gateway.createInviteParams.HasMemberLimit || gateway.createInviteParams.MemberLimit != 50 ||
+		!gateway.createInviteParams.HasCreatesJoinRequest || gateway.createInviteParams.CreatesJoinRequest {
+		t.Fatalf("create invite params = %#v", gateway.createInviteParams)
+	}
+	var response struct {
+		OK     bool           `json:"ok"`
+		Result map[string]any `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.OK || response.Result["name"] != "Marketing" || response.Result["member_limit"] != float64(50) {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+}
+
+func TestEditChatInviteLinkRequiresInviteLink(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "editChatInviteLink", `{"chat_id":-1002000000000,"name":"New name"}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "INVITE_HASH_EMPTY") {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if gateway.editInviteCalled {
+		t.Fatalf("gateway should not be called without invite_link")
+	}
+
+	rec = performBotAPIRequest(t, h, bots.profile, "editChatInviteLink",
+		`{"chat_id":-1002000000000,"invite_link":"https://t.me/+abc123","name":"New name"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.editInviteCalled || gateway.editInviteLink != "https://t.me/+abc123" ||
+		!gateway.editInviteParams.HasName || gateway.editInviteParams.Name != "New name" ||
+		gateway.editInviteParams.HasExpireDate || gateway.editInviteParams.HasMemberLimit {
+		t.Fatalf("edit invite call = %#v params = %#v", gateway.editInviteLink, gateway.editInviteParams)
+	}
+}
+
+func TestRevokeChatInviteLinkForwardsToGateway(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{revokeInviteResult: domain.BotAPIChatInviteLink{
+		InviteLink: "https://t.me/+abc123", IsRevoked: true,
+	}}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "revokeChatInviteLink",
+		`{"chat_id":-1002000000000,"invite_link":"https://t.me/+abc123"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.revokeInviteCalled || gateway.revokeInviteLink != "https://t.me/+abc123" {
+		t.Fatalf("revoke invite call = %#v", gateway)
+	}
+	var response struct {
+		OK     bool           `json:"ok"`
+		Result map[string]any `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.OK || response.Result["is_revoked"] != true {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+}
+
+func TestApproveAndDeclineChatJoinRequest(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "approveChatJoinRequest", `{"chat_id":-1002000000000,"user_id":2002}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("approve status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.joinRequestCalled || !gateway.joinRequestApproved ||
+		gateway.joinRequestChatID != -1002000000000 || gateway.joinRequestUserID != 2002 {
+		t.Fatalf("approve call = %#v", gateway)
+	}
+
+	gateway2 := &fakeBotAPIGateway{}
+	h2 := (&handler{bots: bots, gateway: gateway2}).routes()
+	rec = performBotAPIRequest(t, h2, bots.profile, "declineChatJoinRequest", `{"chat_id":-1002000000000,"user_id":2002}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("decline status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway2.joinRequestCalled || gateway2.joinRequestApproved {
+		t.Fatalf("decline call = %#v", gateway2)
+	}
+}
+
 func TestGetUpdatesProjectsIncomingPrivateText(t *testing.T) {
 	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
 	gateway := &fakeBotAPIGateway{
@@ -1680,6 +1811,36 @@ type fakeBotAPIGateway struct {
 	getChatChatID int64
 	getChatResult domain.BotAPIChatInfo
 	getChatErr    error
+
+	exportInviteCalled bool
+	exportInviteChatID int64
+	exportInviteResult string
+	exportInviteErr    error
+
+	createInviteCalled bool
+	createInviteChatID int64
+	createInviteParams domain.BotAPIInviteLinkParams
+	createInviteResult domain.BotAPIChatInviteLink
+	createInviteErr    error
+
+	editInviteCalled bool
+	editInviteChatID int64
+	editInviteLink   string
+	editInviteParams domain.BotAPIInviteLinkParams
+	editInviteResult domain.BotAPIChatInviteLink
+	editInviteErr    error
+
+	revokeInviteCalled bool
+	revokeInviteChatID int64
+	revokeInviteLink   string
+	revokeInviteResult domain.BotAPIChatInviteLink
+	revokeInviteErr    error
+
+	joinRequestCalled   bool
+	joinRequestApproved bool
+	joinRequestChatID   int64
+	joinRequestUserID   int64
+	joinRequestErr      error
 }
 
 func (f *fakeBotAPIGateway) BotAPIGiftPremiumSubscription(
@@ -1880,6 +2041,68 @@ func (f *fakeBotAPIGateway) BotAPIGetChat(_ context.Context, botID, chatID int64
 		return domain.BotAPIChatInfo{}, f.getChatErr
 	}
 	return f.getChatResult, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIExportChatInviteLink(_ context.Context, _ int64, chatID int64) (string, error) {
+	f.exportInviteCalled = true
+	f.exportInviteChatID = chatID
+	if f.exportInviteErr != nil {
+		return "", f.exportInviteErr
+	}
+	return f.exportInviteResult, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPICreateChatInviteLink(_ context.Context, _ int64, chatID int64, params domain.BotAPIInviteLinkParams) (domain.BotAPIChatInviteLink, error) {
+	f.createInviteCalled = true
+	f.createInviteChatID = chatID
+	f.createInviteParams = params
+	if f.createInviteErr != nil {
+		return domain.BotAPIChatInviteLink{}, f.createInviteErr
+	}
+	return f.createInviteResult, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIEditChatInviteLink(_ context.Context, _ int64, chatID int64, link string, params domain.BotAPIInviteLinkParams) (domain.BotAPIChatInviteLink, error) {
+	f.editInviteCalled = true
+	f.editInviteChatID = chatID
+	f.editInviteLink = link
+	f.editInviteParams = params
+	if f.editInviteErr != nil {
+		return domain.BotAPIChatInviteLink{}, f.editInviteErr
+	}
+	return f.editInviteResult, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIRevokeChatInviteLink(_ context.Context, _ int64, chatID int64, link string) (domain.BotAPIChatInviteLink, error) {
+	f.revokeInviteCalled = true
+	f.revokeInviteChatID = chatID
+	f.revokeInviteLink = link
+	if f.revokeInviteErr != nil {
+		return domain.BotAPIChatInviteLink{}, f.revokeInviteErr
+	}
+	return f.revokeInviteResult, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIApproveChatJoinRequest(_ context.Context, _ int64, chatID, userID int64) (bool, error) {
+	f.joinRequestCalled = true
+	f.joinRequestApproved = true
+	f.joinRequestChatID = chatID
+	f.joinRequestUserID = userID
+	if f.joinRequestErr != nil {
+		return false, f.joinRequestErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIDeclineChatJoinRequest(_ context.Context, _ int64, chatID, userID int64) (bool, error) {
+	f.joinRequestCalled = true
+	f.joinRequestApproved = false
+	f.joinRequestChatID = chatID
+	f.joinRequestUserID = userID
+	if f.joinRequestErr != nil {
+		return false, f.joinRequestErr
+	}
+	return true, nil
 }
 
 func (f *fakeBotAPIGateway) BotAPISendEphemeral(_ context.Context, input domain.BotAPIEphemeralSendInput) (domain.EphemeralMessage, error) {

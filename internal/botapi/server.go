@@ -62,6 +62,15 @@ type GatewayService interface {
 	BotAPISendChatAction(ctx context.Context, botID, chatID int64, action string) (bool, error)
 	// BotAPIGetChat backs the getChat method.
 	BotAPIGetChat(ctx context.Context, botID, chatID int64) (domain.BotAPIChatInfo, error)
+	// Invite-link family: exportChatInviteLink/createChatInviteLink/
+	// editChatInviteLink/revokeChatInviteLink and the join-request
+	// approve/decline pair.
+	BotAPIExportChatInviteLink(ctx context.Context, botID, chatID int64) (string, error)
+	BotAPICreateChatInviteLink(ctx context.Context, botID, chatID int64, params domain.BotAPIInviteLinkParams) (domain.BotAPIChatInviteLink, error)
+	BotAPIEditChatInviteLink(ctx context.Context, botID, chatID int64, link string, params domain.BotAPIInviteLinkParams) (domain.BotAPIChatInviteLink, error)
+	BotAPIRevokeChatInviteLink(ctx context.Context, botID, chatID int64, link string) (domain.BotAPIChatInviteLink, error)
+	BotAPIApproveChatJoinRequest(ctx context.Context, botID, chatID, userID int64) (bool, error)
+	BotAPIDeclineChatJoinRequest(ctx context.Context, botID, chatID, userID int64) (bool, error)
 }
 
 type EphemeralGatewayService interface {
@@ -273,6 +282,18 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.sendChatAction(w, r, botID)
 	case "getchat":
 		h.getChat(w, r, botID)
+	case "exportchatinvitelink":
+		h.exportChatInviteLink(w, r, botID)
+	case "createchatinvitelink":
+		h.createChatInviteLink(w, r, botID)
+	case "editchatinvitelink":
+		h.editChatInviteLink(w, r, botID)
+	case "revokechatinvitelink":
+		h.revokeChatInviteLink(w, r, botID)
+	case "approvechatjoinrequest":
+		h.approveChatJoinRequest(w, r, botID)
+	case "declinechatjoinrequest":
+		h.declineChatJoinRequest(w, r, botID)
 	case "editmessagetext":
 		h.editMessageText(w, r, botID)
 	case "deletemessage":
@@ -1620,6 +1641,11 @@ func apiErrorDescription(err error) string {
 		"PREMIUM_GIFT_SELF_INVALID",
 		"PREMIUM_GIFT_CODE_INVALID",
 		"PAYMENT_FORM_INVALID",
+		"INVITE_HASH_EMPTY",
+		"INVITE_HASH_INVALID",
+		"INVITE_HASH_EXPIRED",
+		"INVITE_LINK_INVALID",
+		"USERS_TOO_MUCH",
 	} {
 		if strings.Contains(text, marker) {
 			return marker

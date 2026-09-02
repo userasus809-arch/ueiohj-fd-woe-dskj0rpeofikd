@@ -1281,3 +1281,180 @@ func (r *Router) BotAPIGetChat(ctx context.Context, botID, chatID int64) (domain
 		LastName:  user.LastName,
 	}, nil
 }
+
+func botAPIChatInviteLinkFromDomain(invite domain.ChannelInvite, publicBaseURL string) domain.BotAPIChatInviteLink {
+	return domain.BotAPIChatInviteLink{
+		InviteLink:              publicLinkWithBaseURL(publicBaseURL, "+"+invite.Hash),
+		CreatorUserID:           invite.AdminUserID,
+		CreatesJoinRequest:      invite.RequestNeeded,
+		IsPrimary:               invite.Permanent,
+		IsRevoked:               invite.Revoked,
+		Name:                    invite.Title,
+		ExpireDate:              invite.ExpireDate,
+		MemberLimit:             invite.UsageLimit,
+		PendingJoinRequestCount: invite.RequestedCount,
+	}
+}
+
+func botAPIInviteChannelPeer(chatID int64) (domain.Peer, bool) {
+	peer, ok := botAPIPeerFromChatID(chatID)
+	if !ok || peer.Type != domain.PeerTypeChannel {
+		return domain.Peer{}, false
+	}
+	return peer, true
+}
+
+// BotAPIExportChatInviteLink backs the exportChatInviteLink method: it
+// generates a new *primary* invite link (any previous primary link is
+// revoked), matching real Telegram's exportChatInviteLink semantics. It
+// returns the bare link string, as the official method does.
+func (r *Router) BotAPIExportChatInviteLink(ctx context.Context, botID, chatID int64) (string, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return "", errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return "", errors.New("CHAT_ID_INVALID")
+	}
+	res, err := r.deps.Channels.ExportInvite(ctx, botID, domain.ExportChannelInviteRequest{
+		UserID:                botID,
+		ChannelID:             peer.ID,
+		LegacyRevokePermanent: true,
+		Date:                  int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return "", err
+	}
+	return publicLinkWithBaseURL(r.cfg.PublicBaseURL, "+"+res.Invite.Hash), nil
+}
+
+// BotAPICreateChatInviteLink backs the createChatInviteLink method: an
+// additional (non-primary) invite link with the caller's optional name,
+// expiry, member limit and join-request policy.
+func (r *Router) BotAPICreateChatInviteLink(ctx context.Context, botID, chatID int64, params domain.BotAPIInviteLinkParams) (domain.BotAPIChatInviteLink, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return domain.BotAPIChatInviteLink{}, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return domain.BotAPIChatInviteLink{}, errors.New("CHAT_ID_INVALID")
+	}
+	if params.ExpireDate < 0 || params.MemberLimit < 0 || len(params.Name) > domain.MaxChannelInviteTitleLength {
+		return domain.BotAPIChatInviteLink{}, errors.New("INVITE_LINK_INVALID")
+	}
+	res, err := r.deps.Channels.ExportInvite(ctx, botID, domain.ExportChannelInviteRequest{
+		UserID:        botID,
+		ChannelID:     peer.ID,
+		Title:         params.Name,
+		RequestNeeded: params.CreatesJoinRequest,
+		ExpireDate:    params.ExpireDate,
+		UsageLimit:    params.MemberLimit,
+		Date:          int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return domain.BotAPIChatInviteLink{}, err
+	}
+	return botAPIChatInviteLinkFromDomain(res.Invite, r.cfg.PublicBaseURL), nil
+}
+
+// BotAPIEditChatInviteLink backs the editChatInviteLink method. Only fields
+// whose Has* flag is set are changed; the rest keep their current value.
+func (r *Router) BotAPIEditChatInviteLink(ctx context.Context, botID, chatID int64, link string, params domain.BotAPIInviteLinkParams) (domain.BotAPIChatInviteLink, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return domain.BotAPIChatInviteLink{}, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return domain.BotAPIChatInviteLink{}, errors.New("CHAT_ID_INVALID")
+	}
+	hash, err := channelInviteHashFromLink(link)
+	if err != nil {
+		return domain.BotAPIChatInviteLink{}, err
+	}
+	if params.HasExpireDate && params.ExpireDate < 0 {
+		return domain.BotAPIChatInviteLink{}, errors.New("INVITE_LINK_INVALID")
+	}
+	if params.HasMemberLimit && params.MemberLimit < 0 {
+		return domain.BotAPIChatInviteLink{}, errors.New("INVITE_LINK_INVALID")
+	}
+	if params.HasName && len(params.Name) > domain.MaxChannelInviteTitleLength {
+		return domain.BotAPIChatInviteLink{}, errors.New("INVITE_LINK_INVALID")
+	}
+	edited, err := r.deps.Channels.EditExportedInvite(ctx, botID, domain.EditChannelInviteRequest{
+		UserID:           botID,
+		ChannelID:        peer.ID,
+		Hash:             hash,
+		HasExpireDate:    params.HasExpireDate,
+		ExpireDate:       params.ExpireDate,
+		HasUsageLimit:    params.HasMemberLimit,
+		UsageLimit:       params.MemberLimit,
+		HasRequestNeeded: params.HasCreatesJoinRequest,
+		RequestNeeded:    params.CreatesJoinRequest,
+		HasTitle:         params.HasName,
+		Title:            params.Name,
+		Date:             int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return domain.BotAPIChatInviteLink{}, err
+	}
+	return botAPIChatInviteLinkFromDomain(edited.Invite, r.cfg.PublicBaseURL), nil
+}
+
+// BotAPIRevokeChatInviteLink backs the revokeChatInviteLink method.
+func (r *Router) BotAPIRevokeChatInviteLink(ctx context.Context, botID, chatID int64, link string) (domain.BotAPIChatInviteLink, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return domain.BotAPIChatInviteLink{}, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return domain.BotAPIChatInviteLink{}, errors.New("CHAT_ID_INVALID")
+	}
+	hash, err := channelInviteHashFromLink(link)
+	if err != nil {
+		return domain.BotAPIChatInviteLink{}, err
+	}
+	edited, err := r.deps.Channels.EditExportedInvite(ctx, botID, domain.EditChannelInviteRequest{
+		UserID:    botID,
+		ChannelID: peer.ID,
+		Hash:      hash,
+		Revoked:   true,
+		Date:      int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return domain.BotAPIChatInviteLink{}, err
+	}
+	return botAPIChatInviteLinkFromDomain(edited.Invite, r.cfg.PublicBaseURL), nil
+}
+
+func (r *Router) botAPIHideChatJoinRequest(ctx context.Context, botID, chatID, userID int64, approved bool) (bool, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if userID <= 0 {
+		return false, errors.New("USER_ID_INVALID")
+	}
+	if _, err := r.deps.Channels.HideChatJoinRequest(ctx, botID, domain.HideChannelJoinRequestRequest{
+		UserID:       botID,
+		ChannelID:    peer.ID,
+		TargetUserID: userID,
+		Approved:     approved,
+		Date:         int(r.clock.Now().Unix()),
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BotAPIApproveChatJoinRequest backs the approveChatJoinRequest method.
+func (r *Router) BotAPIApproveChatJoinRequest(ctx context.Context, botID, chatID, userID int64) (bool, error) {
+	return r.botAPIHideChatJoinRequest(ctx, botID, chatID, userID, true)
+}
+
+// BotAPIDeclineChatJoinRequest backs the declineChatJoinRequest method.
+func (r *Router) BotAPIDeclineChatJoinRequest(ctx context.Context, botID, chatID, userID int64) (bool, error) {
+	return r.botAPIHideChatJoinRequest(ctx, botID, chatID, userID, false)
+}
