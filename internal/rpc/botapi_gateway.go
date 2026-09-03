@@ -15,6 +15,11 @@ import (
 	"telesrv/internal/store"
 )
 
+// maxBotAPIChatAdministrators bounds the getChatAdministrators fetch; real
+// chats rarely have more than a handful of admins, and this keeps a single
+// malicious/misconfigured bot request from pulling a full member list.
+const maxBotAPIChatAdministrators = 200
+
 // BotAPIGiftPremiumSubscription implements the HTTP Bot API method through the
 // same catalog, payment intent, Stars ledger and entitlement transaction used by
 // the MTProto Premium flow.
@@ -1457,4 +1462,406 @@ func (r *Router) BotAPIApproveChatJoinRequest(ctx context.Context, botID, chatID
 // BotAPIDeclineChatJoinRequest backs the declineChatJoinRequest method.
 func (r *Router) BotAPIDeclineChatJoinRequest(ctx context.Context, botID, chatID, userID int64) (bool, error) {
 	return r.botAPIHideChatJoinRequest(ctx, botID, chatID, userID, false)
+}
+
+// botAPIEditBanned is the shared implementation behind banChatMember,
+// unbanChatMember and restrictChatMember: all three ultimately call
+// channels.editBanned with a different ChannelBannedRights shape. It
+// mirrors onChannelsEditBanned's post-write bookkeeping (full-info cache
+// invalidation, online-membership index, fan-out) so a bot-issued
+// ban/restrict is indistinguishable from one issued over MTProto.
+func (r *Router) botAPIEditBanned(ctx context.Context, botID, channelID, targetUserID int64, rights domain.ChannelBannedRights) error {
+	res, err := r.deps.Channels.EditBanned(ctx, botID, domain.EditChannelBannedRequest{
+		UserID:       botID,
+		ChannelID:    channelID,
+		Participant:  domain.Peer{Type: domain.PeerTypeUser, ID: targetUserID},
+		BannedRights: rights,
+		Date:         int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return err
+	}
+	r.invalidateChannelFullBotInfoCacheForChannel(res.Channel.ID)
+	if res.Participant.Status == domain.ChannelMemberActive {
+		r.addOnlineChannelMemberships(res.Channel.ID, res.Participant.UserID)
+	} else {
+		r.removeOnlineChannelMemberships(res.Channel.ID, res.Participant.UserID)
+	}
+	if res.Participant.Status == domain.ChannelMemberKicked && res.Previous.Status == domain.ChannelMemberActive {
+		r.recordChannelStateForUser(ctx, res.Participant.UserID, res.Channel.ID, false)
+	}
+	cache := newViewerPeerCache(r)
+	build := func(viewerUserID int64) *tg.Updates {
+		updates := r.channelParticipantUpdatesWithPeerCache(ctx, viewerUserID, botID, res.Channel, res.Previous, res.Participant, res.Date, cache)
+		if updates != nil && res.ServiceEvent.Pts != 0 {
+			if update := tgChannelUpdate(viewerUserID, res.ServiceEvent); update != nil {
+				updates.Updates = append([]tg.UpdateClass{update}, updates.Updates...)
+			}
+		}
+		return updates
+	}
+	r.pushChannelUpdates(ctx, botID, res.Channel.ID, res.Recipients, build)
+	return nil
+}
+
+// BotAPIBanChatMember backs the banChatMember method: it fully removes the
+// user's ability to view/rejoin the chat (ViewMessages denied) until
+// untilDate (0 means permanent).
+func (r *Router) BotAPIBanChatMember(ctx context.Context, botID, chatID, userID int64, untilDate int) (bool, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if userID <= 0 {
+		return false, errors.New("USER_ID_INVALID")
+	}
+	if untilDate < 0 {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if err := r.botAPIEditBanned(ctx, botID, peer.ID, userID, domain.ChannelBannedRights{
+		ViewMessages: true,
+		UntilDate:    untilDate,
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BotAPIUnbanChatMember backs the unbanChatMember method: it clears every
+// restriction, matching real Telegram's "this does not restore the user to
+// membership, only lifts the ban" contract. When onlyIfBanned is true and
+// the target is not currently kicked/banned, this is a no-op success.
+func (r *Router) BotAPIUnbanChatMember(ctx context.Context, botID, chatID, userID int64, onlyIfBanned bool) (bool, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if userID <= 0 {
+		return false, errors.New("USER_ID_INVALID")
+	}
+	if onlyIfBanned {
+		member, err := r.deps.Channels.GetParticipant(ctx, botID, peer.ID, userID)
+		if err != nil {
+			if errors.Is(err, domain.ErrUserNotParticipant) {
+				return true, nil
+			}
+			return false, err
+		}
+		if member.Status != domain.ChannelMemberKicked && member.Status != domain.ChannelMemberBanned {
+			return true, nil
+		}
+	}
+	if err := r.botAPIEditBanned(ctx, botID, peer.ID, userID, domain.ChannelBannedRights{}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BotAPIRestrictChatMember backs the restrictChatMember method. permissions
+// is already in the internal "denied when true" shape (the HTTP layer
+// inverts the official can_* ChatPermissions booleans before calling this).
+func (r *Router) BotAPIRestrictChatMember(ctx context.Context, botID, chatID, userID int64, permissions domain.ChannelBannedRights, untilDate int) (bool, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if userID <= 0 {
+		return false, errors.New("USER_ID_INVALID")
+	}
+	if untilDate < 0 {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	permissions.UntilDate = untilDate
+	if err := r.botAPIEditBanned(ctx, botID, peer.ID, userID, permissions); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BotAPIPromoteChatMember backs the promoteChatMember method, reusing the
+// same channels.editAdmin path (and its fan-out) MTProto clients use.
+func (r *Router) BotAPIPromoteChatMember(ctx context.Context, botID, chatID, userID int64, rights domain.ChannelAdminRights) (bool, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if userID <= 0 {
+		return false, errors.New("USER_ID_INVALID")
+	}
+	res, err := r.deps.Channels.EditAdmin(ctx, botID, domain.EditChannelAdminRequest{
+		UserID:      botID,
+		ChannelID:   peer.ID,
+		MemberID:    userID,
+		AdminRights: rights,
+		Date:        int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return false, err
+	}
+	r.invalidateChannelFullBotInfoCacheForChannel(res.Channel.ID)
+	if res.Participant.Status == domain.ChannelMemberActive {
+		r.addOnlineChannelMemberships(res.Channel.ID, res.Participant.UserID)
+	} else {
+		r.removeOnlineChannelMemberships(res.Channel.ID, res.Participant.UserID)
+	}
+	cache := newViewerPeerCache(r)
+	r.pushChannelUpdates(ctx, botID, res.Channel.ID, res.Recipients, func(viewerUserID int64) *tg.Updates {
+		return r.channelParticipantUpdatesWithPeerCache(ctx, viewerUserID, botID, res.Channel, res.Previous, res.Participant, res.Date, cache)
+	})
+	return true, nil
+}
+
+// BotAPIPinChatMessage backs the pinChatMessage method.
+func (r *Router) BotAPIPinChatMessage(ctx context.Context, botID, chatID int64, messageID int, silent bool) (bool, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if messageID <= 0 {
+		return false, errors.New("MESSAGE_ID_INVALID")
+	}
+	res, err := r.deps.Channels.UpdatePinnedMessage(ctx, botID, domain.UpdateChannelPinnedMessageRequest{
+		UserID:    botID,
+		ChannelID: peer.ID,
+		MessageID: messageID,
+		Pinned:    true,
+		Silent:    silent,
+		Date:      int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return false, err
+	}
+	r.invalidateRPCProjectionForChannel(res.Channel.ID)
+	r.enqueueChannelFanout(ctx, channelFanoutMessageBox, botID, res.Channel.ID, res.Event.Pts, res.Recipients, func(_ context.Context, viewerUserID int64) *tg.Updates {
+		return r.channelPinnedUpdates(viewerUserID, res)
+	})
+	return true, nil
+}
+
+// BotAPIUnpinChatMessage backs the unpinChatMessage method. When messageID
+// is 0 (the Bot API caller omitted it), it falls back to the channel's
+// current single-pin projection.
+func (r *Router) BotAPIUnpinChatMessage(ctx context.Context, botID, chatID int64, messageID int) (bool, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if messageID <= 0 {
+		view, err := r.deps.Channels.GetChannel(ctx, botID, peer.ID)
+		if err != nil {
+			return false, err
+		}
+		messageID = view.Channel.PinnedMessageID
+		if messageID <= 0 {
+			return false, errors.New("MESSAGE_ID_INVALID")
+		}
+	}
+	res, err := r.deps.Channels.UpdatePinnedMessage(ctx, botID, domain.UpdateChannelPinnedMessageRequest{
+		UserID:    botID,
+		ChannelID: peer.ID,
+		MessageID: messageID,
+		Pinned:    false,
+		Date:      int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return false, err
+	}
+	r.invalidateRPCProjectionForChannel(res.Channel.ID)
+	r.enqueueChannelFanout(ctx, channelFanoutMessageBox, botID, res.Channel.ID, res.Event.Pts, res.Recipients, func(_ context.Context, viewerUserID int64) *tg.Updates {
+		return r.channelPinnedUpdates(viewerUserID, res)
+	})
+	return true, nil
+}
+
+// BotAPIUnpinAllChatMessages backs the unpinAllChatMessages method.
+func (r *Router) BotAPIUnpinAllChatMessages(ctx context.Context, botID, chatID int64) (bool, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if _, err := r.deps.Channels.UnpinAllMessages(ctx, botID, domain.UnpinAllChannelMessagesRequest{
+		UserID:    botID,
+		ChannelID: peer.ID,
+		Date:      int(r.clock.Now().Unix()),
+	}); err != nil {
+		return false, err
+	}
+	r.invalidateRPCProjectionForChannel(peer.ID)
+	return true, nil
+}
+
+// BotAPILeaveChat backs the leaveChat method.
+func (r *Router) BotAPILeaveChat(ctx context.Context, botID, chatID int64) (bool, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if _, err := r.deps.Channels.LeaveChannel(ctx, botID, peer.ID, int(r.clock.Now().Unix())); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BotAPIGetChatMemberCount backs the getChatMemberCount method.
+func (r *Router) BotAPIGetChatMemberCount(ctx context.Context, botID, chatID int64) (int, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return 0, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return 0, errors.New("CHAT_ID_INVALID")
+	}
+	view, err := r.deps.Channels.GetChannel(ctx, botID, peer.ID)
+	if err != nil {
+		return 0, err
+	}
+	if view.Forbidden {
+		return 0, errors.New("CHAT_ID_INVALID")
+	}
+	return view.Channel.ParticipantsCount, nil
+}
+
+// botAPIChatMemberStatus derives the official Bot API status string from
+// this deployment's role/status/rights model.
+func botAPIChatMemberStatus(member domain.ChannelMember) string {
+	switch member.Status {
+	case domain.ChannelMemberLeft:
+		return "left"
+	case domain.ChannelMemberKicked, domain.ChannelMemberBanned:
+		return "kicked"
+	}
+	switch member.Role {
+	case domain.ChannelRoleCreator:
+		return "creator"
+	case domain.ChannelRoleAdmin:
+		return "administrator"
+	}
+	if botAPIMemberIsRestricted(member.BannedRights) {
+		return "restricted"
+	}
+	return "member"
+}
+
+func botAPIMemberIsRestricted(rights domain.ChannelBannedRights) bool {
+	return rights.SendMessages || rights.SendMedia || rights.SendPolls ||
+		rights.SendStickers || rights.SendGifs || rights.SendGames || rights.SendInline ||
+		rights.EmbedLinks || rights.InviteUsers || rights.PinMessages || rights.ChangeInfo ||
+		rights.ManageTopics
+}
+
+func botAPIChatMemberFromDomain(member domain.ChannelMember, user domain.User) domain.BotAPIChatMember {
+	status := botAPIChatMemberStatus(member)
+	out := domain.BotAPIChatMember{
+		Status:      status,
+		UserID:      member.UserID,
+		Username:    user.Username,
+		FirstName:   user.FirstName,
+		LastName:    user.LastName,
+		CustomTitle: member.Rank,
+	}
+	switch status {
+	case "kicked", "restricted":
+		out.UntilDate = member.BannedRights.UntilDate
+	}
+	switch status {
+	case "creator", "administrator":
+		rights := member.AdminRights
+		out.IsAnonymous = rights.Anonymous
+		out.CanManageChat = rights.ManageChat
+		out.CanDeleteMessages = rights.DeleteMessages
+		out.CanManageVideoChats = rights.ManageCall
+		out.CanRestrictMembers = rights.BanUsers
+		out.CanPromoteMembers = rights.AddAdmins
+		out.CanChangeInfo = rights.ChangeInfo
+		out.CanInviteUsers = rights.InviteUsers
+		out.CanPostMessages = rights.PostMessages
+		out.CanEditMessages = rights.EditMessages
+		out.CanPinMessages = rights.PinMessages
+		out.CanManageTopics = rights.ManageTopics
+	case "member", "restricted":
+		rights := member.BannedRights
+		out.IsMember = true
+		out.CanSendMessages = !rights.SendMessages
+		out.CanSendPolls = !rights.SendPolls
+		out.CanSendOtherMessages = !(rights.SendStickers || rights.SendGifs || rights.SendGames || rights.SendInline)
+		out.CanAddWebPagePreviews = !rights.EmbedLinks
+		out.CanPinMessagesMember = !rights.PinMessages
+		out.CanManageTopicsMember = !rights.ManageTopics
+	}
+	return out
+}
+
+// BotAPIGetChatMember backs the getChatMember method.
+func (r *Router) BotAPIGetChatMember(ctx context.Context, botID, chatID, userID int64) (domain.BotAPIChatMember, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return domain.BotAPIChatMember{}, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return domain.BotAPIChatMember{}, errors.New("CHAT_ID_INVALID")
+	}
+	if userID <= 0 {
+		return domain.BotAPIChatMember{}, errors.New("USER_ID_INVALID")
+	}
+	member, err := r.deps.Channels.GetParticipant(ctx, botID, peer.ID, userID)
+	if err != nil {
+		return domain.BotAPIChatMember{}, err
+	}
+	var user domain.User
+	if r.deps.Users != nil {
+		if u, found, err := r.deps.Users.ByID(ctx, botID, userID); err == nil && found {
+			user = u
+		}
+	}
+	return botAPIChatMemberFromDomain(member, user), nil
+}
+
+// BotAPIGetChatAdministrators backs the getChatAdministrators method.
+func (r *Router) BotAPIGetChatAdministrators(ctx context.Context, botID, chatID int64) ([]domain.BotAPIChatMember, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return nil, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return nil, errors.New("CHAT_ID_INVALID")
+	}
+	list, err := r.deps.Channels.GetParticipants(ctx, botID, peer.ID, domain.ChannelParticipantsFilter{
+		Kind: domain.ChannelParticipantsAdmins,
+	}, 0, maxBotAPIChatAdministrators)
+	if err != nil {
+		return nil, err
+	}
+	usersByID := make(map[int64]domain.User, len(list.Users))
+	for _, u := range list.Users {
+		usersByID[u.ID] = u
+	}
+	out := make([]domain.BotAPIChatMember, 0, len(list.Participants))
+	for _, participant := range list.Participants {
+		out = append(out, botAPIChatMemberFromDomain(participant, usersByID[participant.UserID]))
+	}
+	return out, nil
 }

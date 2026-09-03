@@ -492,6 +492,223 @@ func TestApproveAndDeclineChatJoinRequest(t *testing.T) {
 	}
 }
 
+func TestBanChatMemberParsesUntilDate(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "banChatMember", `{"chat_id":-1002000000000,"user_id":2002,"until_date":1700000000}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.banCalled || gateway.banChatID != -1002000000000 ||
+		gateway.banUserID != 2002 || gateway.banUntilDate != 1700000000 {
+		t.Fatalf("ban call = %#v", gateway)
+	}
+}
+
+func TestUnbanChatMemberParsesOnlyIfBanned(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "unbanChatMember", `{"chat_id":-1002000000000,"user_id":2002,"only_if_banned":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.unbanCalled || !gateway.unbanOnlyIfBanned || gateway.unbanUserID != 2002 {
+		t.Fatalf("unban call = %#v", gateway)
+	}
+}
+
+func TestRestrictChatMemberInvertsPermissions(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	body := `{"chat_id":-1002000000000,"user_id":2002,"until_date":1700000000,"permissions":{"can_send_messages":true,"can_send_polls":false,"can_pin_messages":false}}`
+	rec := performBotAPIRequest(t, h, bots.profile, "restrictChatMember", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.restrictCalled || gateway.restrictUntilDate != 1700000000 {
+		t.Fatalf("restrict call = %#v", gateway)
+	}
+	rights := gateway.restrictPermission
+	if rights.SendMessages || !rights.SendPolls || !rights.PinMessages {
+		t.Fatalf("inverted rights = %#v", rights)
+	}
+	// Fields never mentioned in the request default to Go's zero value
+	// (false = "not allowed" per Bot API's documented default), so
+	// can_change_info being absent means ChangeInfo ends up denied (true).
+	if !rights.ChangeInfo {
+		t.Fatalf("omitted permission should default to denied: %#v", rights)
+	}
+}
+
+func TestRestrictChatMemberRequiresPermissions(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "restrictChatMember", `{"chat_id":-1002000000000,"user_id":2002}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if gateway.restrictCalled {
+		t.Fatalf("gateway should not be called without permissions")
+	}
+}
+
+func TestPromoteChatMemberParsesRights(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	body := `{"chat_id":-1002000000000,"user_id":2002,"can_delete_messages":true,"can_pin_messages":true,"can_promote_members":false}`
+	rec := performBotAPIRequest(t, h, bots.profile, "promoteChatMember", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.promoteCalled || !gateway.promoteRights.DeleteMessages ||
+		!gateway.promoteRights.PinMessages || gateway.promoteRights.AddAdmins {
+		t.Fatalf("promote rights = %#v", gateway.promoteRights)
+	}
+}
+
+func TestPinAndUnpinChatMessage(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "pinChatMessage", `{"chat_id":-1002000000000,"message_id":55,"disable_notification":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pin status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.pinCalled || gateway.pinMessageID != 55 || !gateway.pinSilent {
+		t.Fatalf("pin call = %#v", gateway)
+	}
+
+	rec = performBotAPIRequest(t, h, bots.profile, "unpinChatMessage", `{"chat_id":-1002000000000,"message_id":55}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unpin status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.unpinCalled || gateway.unpinMessageID != 55 {
+		t.Fatalf("unpin call = %#v", gateway)
+	}
+
+	rec = performBotAPIRequest(t, h, bots.profile, "unpinAllChatMessages", `{"chat_id":-1002000000000}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unpin all status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.unpinAllCalled || gateway.unpinAllChatID != -1002000000000 {
+		t.Fatalf("unpin all call = %#v", gateway)
+	}
+}
+
+func TestPinChatMessageRequiresMessageID(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "pinChatMessage", `{"chat_id":-1002000000000}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "MESSAGE_ID_INVALID") {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if gateway.pinCalled {
+		t.Fatalf("gateway should not be called without message_id")
+	}
+}
+
+func TestLeaveChatForwardsToGateway(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "leaveChat", `{"chat_id":-1002000000000}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.leaveCalled || gateway.leaveChatID != -1002000000000 {
+		t.Fatalf("leave call = %#v", gateway)
+	}
+}
+
+func TestGetChatMemberCountReturnsResult(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{memberCountResult: 42}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "getChatMemberCount", `{"chat_id":-1002000000000}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		OK     bool `json:"ok"`
+		Result int  `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.OK || response.Result != 42 {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+}
+
+func TestGetChatMemberProjectsAdministratorFields(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{getMemberResult: domain.BotAPIChatMember{
+		Status: "administrator", UserID: 2002, FirstName: "Ada",
+		CanDeleteMessages: true, CanPinMessages: true,
+	}}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "getChatMember", `{"chat_id":-1002000000000,"user_id":2002}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		OK     bool           `json:"ok"`
+		Result map[string]any `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.OK || response.Result["status"] != "administrator" ||
+		response.Result["can_delete_messages"] != true || response.Result["can_pin_messages"] != true {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+	// A "member"-only field must not leak into an administrator projection.
+	if _, has := response.Result["can_send_messages"]; has {
+		t.Fatalf("administrator response should omit member-only fields: %s", rec.Body.String())
+	}
+}
+
+func TestGetChatAdministratorsReturnsList(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{getAdminsResult: []domain.BotAPIChatMember{
+		{Status: "creator", UserID: 1001, FirstName: "Owner"},
+		{Status: "administrator", UserID: 2002, FirstName: "Ada", CanPinMessages: true},
+	}}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "getChatAdministrators", `{"chat_id":-1002000000000}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		OK     bool             `json:"ok"`
+		Result []map[string]any `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.OK || len(response.Result) != 2 ||
+		response.Result[0]["status"] != "creator" || response.Result[1]["status"] != "administrator" {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+}
+
 func TestGetUpdatesProjectsIncomingPrivateText(t *testing.T) {
 	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
 	gateway := &fakeBotAPIGateway{
@@ -1841,6 +2058,66 @@ type fakeBotAPIGateway struct {
 	joinRequestChatID   int64
 	joinRequestUserID   int64
 	joinRequestErr      error
+
+	banCalled    bool
+	banChatID    int64
+	banUserID    int64
+	banUntilDate int
+	banErr       error
+
+	unbanCalled       bool
+	unbanChatID       int64
+	unbanUserID       int64
+	unbanOnlyIfBanned bool
+	unbanErr          error
+
+	restrictCalled     bool
+	restrictChatID     int64
+	restrictUserID     int64
+	restrictPermission domain.ChannelBannedRights
+	restrictUntilDate  int
+	restrictErr        error
+
+	promoteCalled bool
+	promoteChatID int64
+	promoteUserID int64
+	promoteRights domain.ChannelAdminRights
+	promoteErr    error
+
+	pinCalled    bool
+	pinChatID    int64
+	pinMessageID int
+	pinSilent    bool
+	pinErr       error
+
+	unpinCalled    bool
+	unpinChatID    int64
+	unpinMessageID int
+	unpinErr       error
+
+	unpinAllCalled bool
+	unpinAllChatID int64
+	unpinAllErr    error
+
+	leaveCalled bool
+	leaveChatID int64
+	leaveErr    error
+
+	memberCountCalled bool
+	memberCountChatID int64
+	memberCountResult int
+	memberCountErr    error
+
+	getMemberCalled bool
+	getMemberChatID int64
+	getMemberUserID int64
+	getMemberResult domain.BotAPIChatMember
+	getMemberErr    error
+
+	getAdminsCalled bool
+	getAdminsChatID int64
+	getAdminsResult []domain.BotAPIChatMember
+	getAdminsErr    error
 }
 
 func (f *fakeBotAPIGateway) BotAPIGiftPremiumSubscription(
@@ -2103,6 +2380,118 @@ func (f *fakeBotAPIGateway) BotAPIDeclineChatJoinRequest(_ context.Context, _ in
 		return false, f.joinRequestErr
 	}
 	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIBanChatMember(_ context.Context, _ int64, chatID, userID int64, untilDate int) (bool, error) {
+	f.banCalled = true
+	f.banChatID = chatID
+	f.banUserID = userID
+	f.banUntilDate = untilDate
+	if f.banErr != nil {
+		return false, f.banErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIUnbanChatMember(_ context.Context, _ int64, chatID, userID int64, onlyIfBanned bool) (bool, error) {
+	f.unbanCalled = true
+	f.unbanChatID = chatID
+	f.unbanUserID = userID
+	f.unbanOnlyIfBanned = onlyIfBanned
+	if f.unbanErr != nil {
+		return false, f.unbanErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIRestrictChatMember(_ context.Context, _ int64, chatID, userID int64, permissions domain.ChannelBannedRights, untilDate int) (bool, error) {
+	f.restrictCalled = true
+	f.restrictChatID = chatID
+	f.restrictUserID = userID
+	f.restrictPermission = permissions
+	f.restrictUntilDate = untilDate
+	if f.restrictErr != nil {
+		return false, f.restrictErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIPromoteChatMember(_ context.Context, _ int64, chatID, userID int64, rights domain.ChannelAdminRights) (bool, error) {
+	f.promoteCalled = true
+	f.promoteChatID = chatID
+	f.promoteUserID = userID
+	f.promoteRights = rights
+	if f.promoteErr != nil {
+		return false, f.promoteErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIPinChatMessage(_ context.Context, _ int64, chatID int64, messageID int, silent bool) (bool, error) {
+	f.pinCalled = true
+	f.pinChatID = chatID
+	f.pinMessageID = messageID
+	f.pinSilent = silent
+	if f.pinErr != nil {
+		return false, f.pinErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIUnpinChatMessage(_ context.Context, _ int64, chatID int64, messageID int) (bool, error) {
+	f.unpinCalled = true
+	f.unpinChatID = chatID
+	f.unpinMessageID = messageID
+	if f.unpinErr != nil {
+		return false, f.unpinErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIUnpinAllChatMessages(_ context.Context, _ int64, chatID int64) (bool, error) {
+	f.unpinAllCalled = true
+	f.unpinAllChatID = chatID
+	if f.unpinAllErr != nil {
+		return false, f.unpinAllErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPILeaveChat(_ context.Context, _ int64, chatID int64) (bool, error) {
+	f.leaveCalled = true
+	f.leaveChatID = chatID
+	if f.leaveErr != nil {
+		return false, f.leaveErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIGetChatMemberCount(_ context.Context, _ int64, chatID int64) (int, error) {
+	f.memberCountCalled = true
+	f.memberCountChatID = chatID
+	if f.memberCountErr != nil {
+		return 0, f.memberCountErr
+	}
+	return f.memberCountResult, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIGetChatMember(_ context.Context, _ int64, chatID, userID int64) (domain.BotAPIChatMember, error) {
+	f.getMemberCalled = true
+	f.getMemberChatID = chatID
+	f.getMemberUserID = userID
+	if f.getMemberErr != nil {
+		return domain.BotAPIChatMember{}, f.getMemberErr
+	}
+	return f.getMemberResult, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIGetChatAdministrators(_ context.Context, _ int64, chatID int64) ([]domain.BotAPIChatMember, error) {
+	f.getAdminsCalled = true
+	f.getAdminsChatID = chatID
+	if f.getAdminsErr != nil {
+		return nil, f.getAdminsErr
+	}
+	return f.getAdminsResult, nil
 }
 
 func (f *fakeBotAPIGateway) BotAPISendEphemeral(_ context.Context, input domain.BotAPIEphemeralSendInput) (domain.EphemeralMessage, error) {

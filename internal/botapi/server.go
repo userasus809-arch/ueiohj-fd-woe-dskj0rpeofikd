@@ -71,6 +71,20 @@ type GatewayService interface {
 	BotAPIRevokeChatInviteLink(ctx context.Context, botID, chatID int64, link string) (domain.BotAPIChatInviteLink, error)
 	BotAPIApproveChatJoinRequest(ctx context.Context, botID, chatID, userID int64) (bool, error)
 	BotAPIDeclineChatJoinRequest(ctx context.Context, botID, chatID, userID int64) (bool, error)
+	// Chat/member management: ban/unban/restrict/promote, pin/unpin, leave,
+	// and the getChatMember(s)/getChatAdministrators/getChatMemberCount
+	// read methods.
+	BotAPIBanChatMember(ctx context.Context, botID, chatID, userID int64, untilDate int) (bool, error)
+	BotAPIUnbanChatMember(ctx context.Context, botID, chatID, userID int64, onlyIfBanned bool) (bool, error)
+	BotAPIRestrictChatMember(ctx context.Context, botID, chatID, userID int64, permissions domain.ChannelBannedRights, untilDate int) (bool, error)
+	BotAPIPromoteChatMember(ctx context.Context, botID, chatID, userID int64, rights domain.ChannelAdminRights) (bool, error)
+	BotAPIPinChatMessage(ctx context.Context, botID, chatID int64, messageID int, silent bool) (bool, error)
+	BotAPIUnpinChatMessage(ctx context.Context, botID, chatID int64, messageID int) (bool, error)
+	BotAPIUnpinAllChatMessages(ctx context.Context, botID, chatID int64) (bool, error)
+	BotAPILeaveChat(ctx context.Context, botID, chatID int64) (bool, error)
+	BotAPIGetChatMemberCount(ctx context.Context, botID, chatID int64) (int, error)
+	BotAPIGetChatMember(ctx context.Context, botID, chatID, userID int64) (domain.BotAPIChatMember, error)
+	BotAPIGetChatAdministrators(ctx context.Context, botID, chatID int64) ([]domain.BotAPIChatMember, error)
 }
 
 type EphemeralGatewayService interface {
@@ -294,6 +308,28 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.approveChatJoinRequest(w, r, botID)
 	case "declinechatjoinrequest":
 		h.declineChatJoinRequest(w, r, botID)
+	case "banchatmember":
+		h.banChatMember(w, r, botID)
+	case "unbanchatmember":
+		h.unbanChatMember(w, r, botID)
+	case "restrictchatmember":
+		h.restrictChatMember(w, r, botID)
+	case "promotechatmember":
+		h.promoteChatMember(w, r, botID)
+	case "pinchatmessage":
+		h.pinChatMessage(w, r, botID)
+	case "unpinchatmessage":
+		h.unpinChatMessage(w, r, botID)
+	case "unpinallchatmessages":
+		h.unpinAllChatMessages(w, r, botID)
+	case "leavechat":
+		h.leaveChat(w, r, botID)
+	case "getchatmembercount":
+		h.getChatMemberCount(w, r, botID)
+	case "getchatmember":
+		h.getChatMember(w, r, botID)
+	case "getchatadministrators":
+		h.getChatAdministrators(w, r, botID)
 	case "editmessagetext":
 		h.editMessageText(w, r, botID)
 	case "deletemessage":
@@ -1646,6 +1682,9 @@ func apiErrorDescription(err error) string {
 		"INVITE_HASH_EXPIRED",
 		"INVITE_LINK_INVALID",
 		"USERS_TOO_MUCH",
+		"USER_NOT_PARTICIPANT",
+		"USER_KICKED",
+		"PARTICIPANT_ID_INVALID",
 	} {
 		if strings.Contains(text, marker) {
 			return marker
