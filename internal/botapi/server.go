@@ -85,6 +85,12 @@ type GatewayService interface {
 	BotAPIGetChatMemberCount(ctx context.Context, botID, chatID int64) (int, error)
 	BotAPIGetChatMember(ctx context.Context, botID, chatID, userID int64) (domain.BotAPIChatMember, error)
 	BotAPIGetChatAdministrators(ctx context.Context, botID, chatID int64) ([]domain.BotAPIChatMember, error)
+	// Forum topic family.
+	BotAPICreateForumTopic(ctx context.Context, botID, chatID int64, name string, iconColor int, iconCustomEmojiID int64) (domain.BotAPIForumTopic, error)
+	BotAPIEditForumTopic(ctx context.Context, botID, chatID int64, topicID int, name *string, iconCustomEmojiID *int64) (bool, error)
+	BotAPICloseForumTopic(ctx context.Context, botID, chatID int64, topicID int) (bool, error)
+	BotAPIReopenForumTopic(ctx context.Context, botID, chatID int64, topicID int) (bool, error)
+	BotAPIDeleteForumTopic(ctx context.Context, botID, chatID int64, topicID int) (bool, error)
 }
 
 type EphemeralGatewayService interface {
@@ -330,6 +336,16 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.getChatMember(w, r, botID)
 	case "getchatadministrators":
 		h.getChatAdministrators(w, r, botID)
+	case "createforumtopic":
+		h.createForumTopic(w, r, botID)
+	case "editforumtopic":
+		h.editForumTopic(w, r, botID)
+	case "closeforumtopic":
+		h.closeForumTopic(w, r, botID)
+	case "reopenforumtopic":
+		h.reopenForumTopic(w, r, botID)
+	case "deleteforumtopic":
+		h.deleteForumTopic(w, r, botID)
 	case "editmessagetext":
 		h.editMessageText(w, r, botID)
 	case "deletemessage":
@@ -1685,6 +1701,9 @@ func apiErrorDescription(err error) string {
 		"USER_NOT_PARTICIPANT",
 		"USER_KICKED",
 		"PARTICIPANT_ID_INVALID",
+		"TOPIC_TITLE_EMPTY",
+		"LIMIT_INVALID",
+		"CHAT_NOT_MODIFIED",
 	} {
 		if strings.Contains(text, marker) {
 			return marker

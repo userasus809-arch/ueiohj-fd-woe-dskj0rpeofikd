@@ -1865,3 +1865,143 @@ func (r *Router) BotAPIGetChatAdministrators(ctx context.Context, botID, chatID 
 	}
 	return out, nil
 }
+
+// BotAPICreateForumTopic backs the createForumTopic method, reusing the same
+// channels.createForumTopic path (and its message fan-out) MTProto clients
+// use to create the topic's root service message.
+func (r *Router) BotAPICreateForumTopic(ctx context.Context, botID, chatID int64, name string, iconColor int, iconCustomEmojiID int64) (domain.BotAPIForumTopic, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return domain.BotAPIForumTopic{}, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return domain.BotAPIForumTopic{}, errors.New("CHAT_ID_INVALID")
+	}
+	if err := validateForumTopicTitle(name, false); err != nil {
+		return domain.BotAPIForumTopic{}, err
+	}
+	res, err := r.deps.Channels.CreateForumTopic(ctx, botID, domain.CreateChannelForumTopicRequest{
+		UserID:      botID,
+		ChannelID:   peer.ID,
+		Title:       strings.TrimSpace(name),
+		IconColor:   iconColor,
+		IconEmojiID: iconCustomEmojiID,
+		RandomID:    randomNonZeroInt64(),
+		Date:        int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return domain.BotAPIForumTopic{}, err
+	}
+	if !res.Duplicate {
+		sendRes := domain.SendChannelMessageResult{
+			Channel:    res.Channel,
+			Message:    res.Message,
+			Event:      res.Event,
+			Recipients: res.Recipients,
+			Duplicate:  res.Duplicate,
+		}
+		r.enqueueChannelMessageFanout(ctx, botID, sendRes, nil)
+	}
+	return domain.BotAPIForumTopic{
+		MessageThreadID:   res.Topic.TopicID,
+		Name:              res.Topic.Title,
+		IconColor:         res.Topic.IconColor,
+		IconCustomEmojiID: res.Topic.IconEmojiID,
+	}, nil
+}
+
+// botAPIEditForumTopic is the shared implementation behind editForumTopic,
+// closeForumTopic and reopenForumTopic: all three call channels.editForumTopic
+// with a different subset of pointer fields set (nil = leave unchanged).
+func (r *Router) botAPIEditForumTopic(ctx context.Context, botID, chatID int64, topicID int, name *string, iconCustomEmojiID *int64, closed *bool) (bool, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if topicID <= 0 {
+		return false, errors.New("MESSAGE_ID_INVALID")
+	}
+	if name != nil {
+		if err := validateForumTopicTitle(*name, false); err != nil {
+			return false, err
+		}
+		trimmed := strings.TrimSpace(*name)
+		name = &trimmed
+	}
+	res, err := r.deps.Channels.EditForumTopic(ctx, botID, domain.EditChannelForumTopicRequest{
+		UserID:      botID,
+		ChannelID:   peer.ID,
+		TopicID:     topicID,
+		Title:       name,
+		IconEmojiID: iconCustomEmojiID,
+		Closed:      closed,
+		Date:        int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return false, err
+	}
+	sendRes := domain.SendChannelMessageResult{
+		Channel:    res.Channel,
+		Message:    res.Message,
+		Event:      res.Event,
+		Recipients: res.Recipients,
+	}
+	r.enqueueChannelMessageFanout(ctx, botID, sendRes, nil)
+	return true, nil
+}
+
+// BotAPIEditForumTopic backs the editForumTopic method.
+func (r *Router) BotAPIEditForumTopic(ctx context.Context, botID, chatID int64, topicID int, name *string, iconCustomEmojiID *int64) (bool, error) {
+	return r.botAPIEditForumTopic(ctx, botID, chatID, topicID, name, iconCustomEmojiID, nil)
+}
+
+// BotAPICloseForumTopic backs the closeForumTopic method.
+func (r *Router) BotAPICloseForumTopic(ctx context.Context, botID, chatID int64, topicID int) (bool, error) {
+	closed := true
+	return r.botAPIEditForumTopic(ctx, botID, chatID, topicID, nil, nil, &closed)
+}
+
+// BotAPIReopenForumTopic backs the reopenForumTopic method.
+func (r *Router) BotAPIReopenForumTopic(ctx context.Context, botID, chatID int64, topicID int) (bool, error) {
+	closed := false
+	return r.botAPIEditForumTopic(ctx, botID, chatID, topicID, nil, nil, &closed)
+}
+
+// BotAPIDeleteForumTopic backs the deleteForumTopic method: it deletes the
+// topic along with its entire message history, matching the official
+// method's documented behavior.
+func (r *Router) BotAPIDeleteForumTopic(ctx context.Context, botID, chatID int64, topicID int) (bool, error) {
+	if r == nil || r.deps.Channels == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	peer, ok := botAPIInviteChannelPeer(chatID)
+	if !ok {
+		return false, errors.New("CHAT_ID_INVALID")
+	}
+	if topicID <= 0 {
+		return false, errors.New("MESSAGE_ID_INVALID")
+	}
+	res, err := r.deps.Channels.DeleteForumTopicHistory(ctx, botID, domain.DeleteChannelForumTopicHistoryRequest{
+		UserID:    botID,
+		ChannelID: peer.ID,
+		TopicID:   topicID,
+		Date:      int(r.clock.Now().Unix()),
+	})
+	if err != nil {
+		return false, err
+	}
+	if res.Event.Pts != 0 {
+		r.enqueueChannelFanout(ctx, channelFanoutMessageBox, botID, res.Channel.ID, res.Event.Pts, res.Recipients, func(_ context.Context, viewerUserID int64) *tg.Updates {
+			return &tg.Updates{
+				Updates: []tg.UpdateClass{tgChannelUpdate(viewerUserID, res.Event)},
+				Chats:   []tg.ChatClass{tgChannelChatMin(viewerUserID, res.Channel)},
+				Date:    res.Event.Date,
+				Seq:     0,
+			}
+		})
+	}
+	return true, nil
+}

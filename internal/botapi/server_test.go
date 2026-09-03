@@ -709,6 +709,108 @@ func TestGetChatAdministratorsReturnsList(t *testing.T) {
 	}
 }
 
+func TestCreateForumTopicRequiresName(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "createForumTopic", `{"chat_id":-1002000000000}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "TOPIC_TITLE_EMPTY") {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if gateway.createTopicCalled {
+		t.Fatalf("gateway should not be called without name")
+	}
+}
+
+func TestCreateForumTopicReturnsProjectedTopic(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{createTopicResult: domain.BotAPIForumTopic{
+		MessageThreadID: 77, Name: "Support", IconColor: 0x6FB9F0,
+	}}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "createForumTopic", `{"chat_id":-1002000000000,"name":"Support","icon_color":7322096}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.createTopicCalled || gateway.createTopicName != "Support" || gateway.createTopicColor != 7322096 {
+		t.Fatalf("create topic call = %#v", gateway)
+	}
+	var response struct {
+		OK     bool           `json:"ok"`
+		Result map[string]any `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.OK || response.Result["message_thread_id"] != float64(77) || response.Result["name"] != "Support" {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+	if _, hasEmoji := response.Result["icon_custom_emoji_id"]; hasEmoji {
+		t.Fatalf("response should omit icon_custom_emoji_id when unset: %s", rec.Body.String())
+	}
+}
+
+func TestEditForumTopicPassesOptionalFields(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "editForumTopic", `{"chat_id":-1002000000000,"message_thread_id":77,"name":"Renamed"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.editTopicCalled || gateway.editTopicID != 77 ||
+		gateway.editTopicName == nil || *gateway.editTopicName != "Renamed" || gateway.editTopicEmojiID != nil {
+		t.Fatalf("edit topic call = %#v name=%v", gateway, gateway.editTopicName)
+	}
+}
+
+func TestCloseAndReopenForumTopic(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "closeForumTopic", `{"chat_id":-1002000000000,"message_thread_id":77}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("close status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.closeTopicCalled || gateway.closeTopicID != 77 {
+		t.Fatalf("close call = %#v", gateway)
+	}
+
+	rec = performBotAPIRequest(t, h, bots.profile, "reopenForumTopic", `{"chat_id":-1002000000000,"message_thread_id":77}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reopen status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.reopenTopicCalled || gateway.reopenTopicID != 77 {
+		t.Fatalf("reopen call = %#v", gateway)
+	}
+}
+
+func TestDeleteForumTopicRequiresTopicID(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "deleteForumTopic", `{"chat_id":-1002000000000}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "MESSAGE_ID_INVALID") {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if gateway.deleteTopicCalled {
+		t.Fatalf("gateway should not be called without message_thread_id")
+	}
+
+	rec = performBotAPIRequest(t, h, bots.profile, "deleteForumTopic", `{"chat_id":-1002000000000,"message_thread_id":77}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.deleteTopicCalled || gateway.deleteTopicID != 77 {
+		t.Fatalf("delete call = %#v", gateway)
+	}
+}
+
 func TestGetUpdatesProjectsIncomingPrivateText(t *testing.T) {
 	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
 	gateway := &fakeBotAPIGateway{
@@ -2118,6 +2220,36 @@ type fakeBotAPIGateway struct {
 	getAdminsChatID int64
 	getAdminsResult []domain.BotAPIChatMember
 	getAdminsErr    error
+
+	createTopicCalled  bool
+	createTopicChatID  int64
+	createTopicName    string
+	createTopicColor   int
+	createTopicEmojiID int64
+	createTopicResult  domain.BotAPIForumTopic
+	createTopicErr     error
+
+	editTopicCalled  bool
+	editTopicChatID  int64
+	editTopicID      int
+	editTopicName    *string
+	editTopicEmojiID *int64
+	editTopicErr     error
+
+	closeTopicCalled bool
+	closeTopicChatID int64
+	closeTopicID     int
+	closeTopicErr    error
+
+	reopenTopicCalled bool
+	reopenTopicChatID int64
+	reopenTopicID     int
+	reopenTopicErr    error
+
+	deleteTopicCalled bool
+	deleteTopicChatID int64
+	deleteTopicID     int
+	deleteTopicErr    error
 }
 
 func (f *fakeBotAPIGateway) BotAPIGiftPremiumSubscription(
@@ -2492,6 +2624,60 @@ func (f *fakeBotAPIGateway) BotAPIGetChatAdministrators(_ context.Context, _ int
 		return nil, f.getAdminsErr
 	}
 	return f.getAdminsResult, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPICreateForumTopic(_ context.Context, _ int64, chatID int64, name string, iconColor int, iconCustomEmojiID int64) (domain.BotAPIForumTopic, error) {
+	f.createTopicCalled = true
+	f.createTopicChatID = chatID
+	f.createTopicName = name
+	f.createTopicColor = iconColor
+	f.createTopicEmojiID = iconCustomEmojiID
+	if f.createTopicErr != nil {
+		return domain.BotAPIForumTopic{}, f.createTopicErr
+	}
+	return f.createTopicResult, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIEditForumTopic(_ context.Context, _ int64, chatID int64, topicID int, name *string, iconCustomEmojiID *int64) (bool, error) {
+	f.editTopicCalled = true
+	f.editTopicChatID = chatID
+	f.editTopicID = topicID
+	f.editTopicName = name
+	f.editTopicEmojiID = iconCustomEmojiID
+	if f.editTopicErr != nil {
+		return false, f.editTopicErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPICloseForumTopic(_ context.Context, _ int64, chatID int64, topicID int) (bool, error) {
+	f.closeTopicCalled = true
+	f.closeTopicChatID = chatID
+	f.closeTopicID = topicID
+	if f.closeTopicErr != nil {
+		return false, f.closeTopicErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIReopenForumTopic(_ context.Context, _ int64, chatID int64, topicID int) (bool, error) {
+	f.reopenTopicCalled = true
+	f.reopenTopicChatID = chatID
+	f.reopenTopicID = topicID
+	if f.reopenTopicErr != nil {
+		return false, f.reopenTopicErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIDeleteForumTopic(_ context.Context, _ int64, chatID int64, topicID int) (bool, error) {
+	f.deleteTopicCalled = true
+	f.deleteTopicChatID = chatID
+	f.deleteTopicID = topicID
+	if f.deleteTopicErr != nil {
+		return false, f.deleteTopicErr
+	}
+	return true, nil
 }
 
 func (f *fakeBotAPIGateway) BotAPISendEphemeral(_ context.Context, input domain.BotAPIEphemeralSendInput) (domain.EphemeralMessage, error) {
