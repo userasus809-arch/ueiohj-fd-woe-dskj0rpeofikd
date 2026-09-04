@@ -1028,6 +1028,7 @@ type ModerationService interface {
 	ReportStories(ctx context.Context, req domain.ModerationStoryReportRequest) (domain.ModerationReport, bool, error)
 	ReportEphemeral(ctx context.Context, reporterUserID int64, target domain.EphemeralMessage, reason domain.ModerationReason, option, comment string, createdAt time.Time) (domain.ModerationReport, bool, error)
 	SponsoredImpression(ctx context.Context, userID int64, randomID []byte, now time.Time) (domain.SponsoredMessageImpression, error)
+	CreateSponsoredImpression(ctx context.Context, impression domain.SponsoredMessageImpression) (domain.SponsoredMessageImpression, error)
 	ReportSponsored(ctx context.Context, userID int64, randomID []byte, reason domain.ModerationReason, option string, now time.Time) (domain.ModerationReport, bool, error)
 	ReportAntiSpamFalsePositive(ctx context.Context, reporterUserID, channelID int64, messageID int, now time.Time) (domain.ModerationReport, bool, error)
 }
@@ -1172,6 +1173,16 @@ type Deps struct {
 	Gifts                      GiftsService
 	Passkey                    PasskeyService
 	Themes                     ThemeService
+	Ads                        AdsService
+}
+
+// AdsService abstracts admin-managed ad campaigns (internal/app/ads):
+// campaign CRUD for the admin panel, and campaign selection/counters for
+// messages.getSponsoredMessages and its view/click follow-ups.
+type AdsService interface {
+	SelectSponsoredMessage(ctx context.Context, channelID int64) (domain.AdCampaign, bool, error)
+	RecordView(ctx context.Context, campaignID int64) error
+	RecordClick(ctx context.Context, campaignID int64) error
 }
 
 // ThemeService 抽象自定义云主题(app/themes):创建/更新/查询主题 + 维护每用户已安装列表。

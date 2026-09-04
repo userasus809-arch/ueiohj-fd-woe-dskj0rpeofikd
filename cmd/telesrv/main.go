@@ -26,6 +26,7 @@ import (
 	adminapp "telesrv/internal/admin"
 	"telesrv/internal/adminapi"
 	"telesrv/internal/app/account"
+	adsapp "telesrv/internal/app/ads"
 	aiapp "telesrv/internal/app/ai"
 	"telesrv/internal/app/auth"
 	authdiagnosticsapp "telesrv/internal/app/authdiagnostics"
@@ -837,6 +838,8 @@ func run(logger *zap.Logger) error {
 		postgres.WithMessageLogger(logger.Named("store").Named("messages")))
 	broadcastStore := postgres.NewBroadcastStore(pool)
 	broadcastService := broadcastapp.NewService(broadcastStore, messageStore, logger.Named("app").Named("broadcast"))
+	adCampaignStore := postgres.NewAdCampaignStore(pool)
+	adsService := adsapp.NewService(adCampaignStore, logger.Named("app").Named("ads"))
 	// 共享频道行/成员缓存 + 统一 read-model LISTEN/NOTIFY 实时失效：消除高频「逐 RPC
 	// 解析频道/成员」在客户端重连同步突发里重复读同一行的放大。
 	channelRowCache := postgres.NewChannelRowCache(cfg.ChannelRowCacheMaxEntries)
@@ -1645,6 +1648,7 @@ func run(logger *zap.Logger) error {
 		GiftGranter:            router,
 		Bots:                   botsService,
 		Broadcast:              broadcastService,
+		Ads:                    adsService,
 		Emoji:                  filesService,
 		StickerSets:            filesService,
 		GifCatalog:             filesService,

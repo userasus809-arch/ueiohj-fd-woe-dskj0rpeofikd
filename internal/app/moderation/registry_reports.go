@@ -8,6 +8,22 @@ import (
 	"telesrv/internal/domain"
 )
 
+// CreateSponsoredImpression records the server-issued evidence that a
+// sponsored message with randomID was actually served to userID, before
+// any report/view/click referencing that randomID can be accepted. Callers
+// build evidence themselves (see NewSponsoredMessageImpression); this is a
+// thin passthrough to the registry store.
+func (s *Service) CreateSponsoredImpression(ctx context.Context, impression domain.SponsoredMessageImpression) (domain.SponsoredMessageImpression, error) {
+	if s == nil || s.registry == nil {
+		return domain.SponsoredMessageImpression{}, domain.ErrModerationReportInvalid
+	}
+	stored, _, err := s.registry.CreateSponsoredMessageImpression(ctx, impression)
+	if err != nil {
+		return domain.SponsoredMessageImpression{}, err
+	}
+	return stored, nil
+}
+
 func (s *Service) SponsoredImpression(ctx context.Context, userID int64, randomID []byte, now time.Time) (domain.SponsoredMessageImpression, error) {
 	if s == nil || s.registry == nil || len(randomID) == 0 {
 		return domain.SponsoredMessageImpression{}, domain.ErrModerationEvidenceNotFound

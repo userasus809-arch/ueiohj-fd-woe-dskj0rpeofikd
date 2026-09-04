@@ -156,6 +156,12 @@ func (r *Router) registerMessages(d *tlprofile.Dispatcher) {
 	registerRPC[*tg.MessagesGetSponsoredMessagesRequest](d, tlprofile.SemanticMethodMessagesGetSponsoredMessages, func(ctx context.Context, layerRequest *tg.MessagesGetSponsoredMessagesRequest) (any, error) {
 		return r.onMessagesGetSponsoredMessages(ctx, layerRequest)
 	})
+	registerRPC[*tg.MessagesViewSponsoredMessageRequest](d, tlprofile.SemanticMethodMessagesViewSponsoredMessage, func(ctx context.Context, layerRequest *tg.MessagesViewSponsoredMessageRequest) (any, error) {
+		return r.onMessagesViewSponsoredMessage(ctx, layerRequest)
+	})
+	registerRPC[*tg.MessagesClickSponsoredMessageRequest](d, tlprofile.SemanticMethodMessagesClickSponsoredMessage, func(ctx context.Context, layerRequest *tg.MessagesClickSponsoredMessageRequest) (any, error) {
+		return r.onMessagesClickSponsoredMessage(ctx, layerRequest)
+	})
 	registerRPC[*tg.MessagesGetWebPagePreviewRequest](d, tlprofile.SemanticMethodMessagesGetWebPagePreview, func(ctx context.Context, layerRequest *tg.MessagesGetWebPagePreviewRequest) (any, error) {
 		return r.onMessagesGetWebPagePreview(ctx, layerRequest)
 	})

@@ -2,12 +2,16 @@ package rpc
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"sort"
+	"time"
 	"unicode/utf8"
 
 	"github.com/iamxvbaba/td/tg"
 	"github.com/iamxvbaba/td/tgerr"
+	"go.uber.org/zap"
 
 	compatandroid "telesrv/internal/compat/android"
 	"telesrv/internal/domain"
@@ -386,9 +390,110 @@ func clientTelemetryError(err error) error {
 	}
 }
 
+// sponsoredImpressionLifetime is how long a served ad's random_id stays
+// valid for view/click/report follow-ups.
+const sponsoredImpressionLifetime = 24 * time.Hour
+
 func (r *Router) onMessagesGetSponsoredMessages(ctx context.Context, req *tg.MessagesGetSponsoredMessagesRequest) (tg.MessagesSponsoredMessagesClass, error) {
-	if _, _, err := r.currentUserID(ctx); err != nil {
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
 		return nil, internalErr()
 	}
-	return &tg.MessagesSponsoredMessagesEmpty{}, nil
+	if r.deps.Ads == nil {
+		return &tg.MessagesSponsoredMessagesEmpty{}, nil
+	}
+	peer, ok := r.domainPeerFromInputPeer(userID, req.Peer)
+	if !ok || peer.Type != domain.PeerTypeChannel {
+		return &tg.MessagesSponsoredMessagesEmpty{}, nil
+	}
+	campaign, found, err := r.deps.Ads.SelectSponsoredMessage(ctx, peer.ID)
+	if err != nil || !found {
+		return &tg.MessagesSponsoredMessagesEmpty{}, nil
+	}
+	randomID := make([]byte, 16)
+	if _, err := rand.Read(randomID); err != nil {
+		return &tg.MessagesSponsoredMessagesEmpty{}, nil
+	}
+	canReport := false
+	if r.deps.Moderation != nil {
+		now := r.clock.Now()
+		evidence, err := json.Marshal(map[string]any{"campaign_id": campaign.ID})
+		if err == nil {
+			impression, buildErr := domain.NewSponsoredMessageImpression(
+				userID, randomID, peer, 0, evidence, now, now.Add(sponsoredImpressionLifetime),
+			)
+			if buildErr == nil {
+				if _, err := r.deps.Moderation.CreateSponsoredImpression(ctx, impression); err != nil {
+					r.log.Warn("create sponsored impression", zap.Int64("campaign_id", campaign.ID), zap.Error(err))
+				} else {
+					canReport = true
+				}
+			}
+		}
+	}
+	msg := tg.SponsoredMessage{
+		CanReport:  canReport,
+		RandomID:   randomID,
+		URL:        campaign.URL,
+		Title:      campaign.SponsorInfo,
+		Message:    campaign.Message,
+		Entities:   tgMessageEntities(campaign.Entities),
+		ButtonText: campaign.ButtonText,
+	}
+	return &tg.MessagesSponsoredMessages{Messages: []tg.SponsoredMessage{msg}}, nil
+}
+
+// onMessagesViewSponsoredMessage and onMessagesClickSponsoredMessage both
+// resolve random_id back to the campaign that produced it via the same
+// impression evidence getSponsoredMessages recorded, then bump the
+// matching counter. Per the official contract, neither reports failure
+// back to the caller for an unknown/expired random_id: clients fire these
+// best-effort and don't expect (or handle) an error.
+func (r *Router) sponsoredCampaignIDForRandomID(ctx context.Context, userID int64, randomID []byte) (int64, bool) {
+	if r.deps.Moderation == nil {
+		return 0, false
+	}
+	impression, err := r.deps.Moderation.SponsoredImpression(ctx, userID, randomID, r.clock.Now())
+	if err != nil {
+		return 0, false
+	}
+	var evidence struct {
+		CampaignID int64 `json:"campaign_id"`
+	}
+	if err := json.Unmarshal(impression.Evidence, &evidence); err != nil || evidence.CampaignID <= 0 {
+		return 0, false
+	}
+	return evidence.CampaignID, true
+}
+
+func (r *Router) onMessagesViewSponsoredMessage(ctx context.Context, req *tg.MessagesViewSponsoredMessageRequest) (bool, error) {
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return false, internalErr()
+	}
+	if r.deps.Ads == nil {
+		return true, nil
+	}
+	if campaignID, ok := r.sponsoredCampaignIDForRandomID(ctx, userID, req.RandomID); ok {
+		if err := r.deps.Ads.RecordView(ctx, campaignID); err != nil {
+			r.log.Warn("record sponsored view", zap.Int64("campaign_id", campaignID), zap.Error(err))
+		}
+	}
+	return true, nil
+}
+
+func (r *Router) onMessagesClickSponsoredMessage(ctx context.Context, req *tg.MessagesClickSponsoredMessageRequest) (bool, error) {
+	userID, _, err := r.currentUserID(ctx)
+	if err != nil {
+		return false, internalErr()
+	}
+	if r.deps.Ads == nil {
+		return true, nil
+	}
+	if campaignID, ok := r.sponsoredCampaignIDForRandomID(ctx, userID, req.RandomID); ok {
+		if err := r.deps.Ads.RecordClick(ctx, campaignID); err != nil {
+			r.log.Warn("record sponsored click", zap.Int64("campaign_id", campaignID), zap.Error(err))
+		}
+	}
+	return true, nil
 }
