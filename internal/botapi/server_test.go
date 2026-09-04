@@ -811,6 +811,194 @@ func TestDeleteForumTopicRequiresTopicID(t *testing.T) {
 	}
 }
 
+func TestGetStickerSetProjectsStickers(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{
+		getStickerSetResult: domain.StickerSet{ShortName: "pack1", Title: "Pack One", Kind: domain.StickerSetKindStickers},
+		getStickerSetDocs: []domain.Document{{
+			ID: 55, MimeType: "image/webp", Size: 100,
+			Attributes: []domain.DocumentAttribute{{Kind: domain.DocAttrSticker, W: 512, H: 512, Alt: "😀"}},
+		}},
+	}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "getStickerSet", `{"name":"pack1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.getStickerSetCalled || gateway.getStickerSetName != "pack1" {
+		t.Fatalf("get sticker set call = %#v", gateway)
+	}
+	var response struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Name        string           `json:"name"`
+			Title       string           `json:"title"`
+			StickerType string           `json:"sticker_type"`
+			Stickers    []map[string]any `json:"stickers"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.OK || response.Result.Name != "pack1" || response.Result.StickerType != "regular" ||
+		len(response.Result.Stickers) != 1 || response.Result.Stickers[0]["emoji"] != "😀" {
+		t.Fatalf("response = %s", rec.Body.String())
+	}
+}
+
+func TestGetStickerSetRequiresName(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "getStickerSet", `{}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "STICKERSET_INVALID") {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if gateway.getStickerSetCalled {
+		t.Fatalf("gateway should not be called without name")
+	}
+}
+
+func TestUploadStickerFileMultipart(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{uploadStickerResult: domain.Document{
+		ID: 77, MimeType: "image/webp", Size: 5,
+	}}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("sticker", "s.webp")
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := part.Write([]byte("webp!")); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart: %v", err)
+	}
+	token := domain.FormatBotToken(bots.profile.BotUserID, bots.profile.TokenSecret)
+	req := httptest.NewRequest(http.MethodPost, "/bot"+token+"/uploadStickerFile", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.uploadStickerCalled || gateway.uploadStickerName != "s.webp" || string(gateway.uploadStickerBytes) != "webp!" {
+		t.Fatalf("upload call = %#v", gateway)
+	}
+}
+
+func TestCreateNewStickerSetParsesStickersArray(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	existingFileID := encodeBotAPIFileID("doc:99")
+	body := `{"user_id":2002,"name":"pack1_by_bot","title":"Pack One","sticker_type":"regular","stickers":[{"sticker":"` + existingFileID + `","emoji_list":["😀","😄"]}]}`
+	rec := performBotAPIRequest(t, h, bots.profile, "createNewStickerSet", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.createStickerSetCalled || gateway.createStickerSetOwnerUserID != 2002 ||
+		gateway.createStickerSetName != "pack1_by_bot" || gateway.createStickerSetTitle != "Pack One" {
+		t.Fatalf("create sticker set call = %#v", gateway)
+	}
+	if len(gateway.createStickerSetStickers) != 1 || gateway.createStickerSetStickers[0].LocationKey != "doc:99" ||
+		gateway.createStickerSetStickers[0].Emoji != "😀😄" {
+		t.Fatalf("parsed stickers = %#v", gateway.createStickerSetStickers)
+	}
+}
+
+func TestCreateNewStickerSetRequiresStickers(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "createNewStickerSet", `{"user_id":2002,"name":"pack1_by_bot","title":"Pack One"}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "STICKERS_EMPTY") {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if gateway.createStickerSetCalled {
+		t.Fatalf("gateway should not be called without stickers")
+	}
+}
+
+func TestAddStickerToSetParsesFileIDAndKeywords(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	existingFileID := encodeBotAPIFileID("doc:99")
+	body := `{"user_id":2002,"name":"pack1_by_bot","sticker":{"sticker":"` + existingFileID + `","emoji_list":["🎉"],"keywords":["party","fun"]}}`
+	rec := performBotAPIRequest(t, h, bots.profile, "addStickerToSet", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.addStickerCalled || gateway.addStickerOwnerUserID != 2002 || gateway.addStickerName != "pack1_by_bot" ||
+		gateway.addStickerInput.LocationKey != "doc:99" || gateway.addStickerInput.Emoji != "🎉" ||
+		gateway.addStickerInput.Keywords != "party,fun" {
+		t.Fatalf("add sticker call = %#v", gateway)
+	}
+}
+
+func TestDeleteStickerFromSetDecodesFileID(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	fileID := encodeBotAPIFileID("doc:99")
+	rec := performBotAPIRequest(t, h, bots.profile, "deleteStickerFromSet", `{"sticker":"`+fileID+`"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.deleteStickerCalled || gateway.deleteStickerLocationKey != "doc:99" {
+		t.Fatalf("delete sticker call = %#v", gateway)
+	}
+}
+
+func TestSetStickerPositionInSetParsesPosition(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	fileID := encodeBotAPIFileID("doc:99")
+	rec := performBotAPIRequest(t, h, bots.profile, "setStickerPositionInSet", `{"sticker":"`+fileID+`","position":3}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.setStickerPositionCalled || gateway.setStickerPositionLocationKey != "doc:99" || gateway.setStickerPosition != 3 {
+		t.Fatalf("set position call = %#v", gateway)
+	}
+}
+
+func TestSetStickerSetTitleAndDeleteStickerSet(t *testing.T) {
+	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
+	gateway := &fakeBotAPIGateway{}
+	h := (&handler{bots: bots, gateway: gateway}).routes()
+
+	rec := performBotAPIRequest(t, h, bots.profile, "setStickerSetTitle", `{"name":"pack1_by_bot","title":"New Title"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("title status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.setStickerSetTitleCalled || gateway.setStickerSetTitleName != "pack1_by_bot" || gateway.setStickerSetTitleValue != "New Title" {
+		t.Fatalf("set title call = %#v", gateway)
+	}
+
+	rec = performBotAPIRequest(t, h, bots.profile, "deleteStickerSet", `{"name":"pack1_by_bot"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !gateway.deleteStickerSetCalled || gateway.deleteStickerSetName != "pack1_by_bot" {
+		t.Fatalf("delete set call = %#v", gateway)
+	}
+}
+
 func TestGetUpdatesProjectsIncomingPrivateText(t *testing.T) {
 	bots := &fakeBotAPIBots{profile: domain.BotProfile{BotUserID: 1001, TokenSecret: "secret"}}
 	gateway := &fakeBotAPIGateway{
@@ -2250,6 +2438,133 @@ type fakeBotAPIGateway struct {
 	deleteTopicChatID int64
 	deleteTopicID     int
 	deleteTopicErr    error
+
+	getStickerSetCalled bool
+	getStickerSetName   string
+	getStickerSetResult domain.StickerSet
+	getStickerSetDocs   []domain.Document
+	getStickerSetErr    error
+
+	uploadStickerCalled bool
+	uploadStickerBytes  []byte
+	uploadStickerName   string
+	uploadStickerMime   string
+	uploadStickerResult domain.Document
+	uploadStickerErr    error
+
+	createStickerSetCalled      bool
+	createStickerSetOwnerUserID int64
+	createStickerSetName        string
+	createStickerSetTitle       string
+	createStickerSetType        string
+	createStickerSetStickers    []domain.BotAPIInputSticker
+	createStickerSetErr         error
+
+	addStickerCalled      bool
+	addStickerOwnerUserID int64
+	addStickerName        string
+	addStickerInput       domain.BotAPIInputSticker
+	addStickerErr         error
+
+	deleteStickerCalled      bool
+	deleteStickerLocationKey string
+	deleteStickerErr         error
+
+	setStickerPositionCalled      bool
+	setStickerPositionLocationKey string
+	setStickerPosition            int
+	setStickerPositionErr         error
+
+	setStickerSetTitleCalled bool
+	setStickerSetTitleName   string
+	setStickerSetTitleValue  string
+	setStickerSetTitleErr    error
+
+	deleteStickerSetCalled bool
+	deleteStickerSetName   string
+	deleteStickerSetErr    error
+}
+
+func (f *fakeBotAPIGateway) BotAPIGetStickerSet(_ context.Context, _ int64, name string) (domain.StickerSet, []domain.Document, error) {
+	f.getStickerSetCalled = true
+	f.getStickerSetName = name
+	if f.getStickerSetErr != nil {
+		return domain.StickerSet{}, nil, f.getStickerSetErr
+	}
+	return f.getStickerSetResult, f.getStickerSetDocs, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIUploadStickerFile(_ context.Context, _ int64, fileBytes []byte, fileName, mimeType string) (domain.Document, error) {
+	f.uploadStickerCalled = true
+	f.uploadStickerBytes = fileBytes
+	f.uploadStickerName = fileName
+	f.uploadStickerMime = mimeType
+	if f.uploadStickerErr != nil {
+		return domain.Document{}, f.uploadStickerErr
+	}
+	return f.uploadStickerResult, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPICreateNewStickerSet(_ context.Context, _, ownerUserID int64, name, title, stickerType string, stickers []domain.BotAPIInputSticker) (bool, error) {
+	f.createStickerSetCalled = true
+	f.createStickerSetOwnerUserID = ownerUserID
+	f.createStickerSetName = name
+	f.createStickerSetTitle = title
+	f.createStickerSetType = stickerType
+	f.createStickerSetStickers = stickers
+	if f.createStickerSetErr != nil {
+		return false, f.createStickerSetErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIAddStickerToSet(_ context.Context, _, ownerUserID int64, name string, sticker domain.BotAPIInputSticker) (bool, error) {
+	f.addStickerCalled = true
+	f.addStickerOwnerUserID = ownerUserID
+	f.addStickerName = name
+	f.addStickerInput = sticker
+	if f.addStickerErr != nil {
+		return false, f.addStickerErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIDeleteStickerFromSet(_ context.Context, _ int64, stickerLocationKey string) (bool, error) {
+	f.deleteStickerCalled = true
+	f.deleteStickerLocationKey = stickerLocationKey
+	if f.deleteStickerErr != nil {
+		return false, f.deleteStickerErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPISetStickerPositionInSet(_ context.Context, _ int64, stickerLocationKey string, position int) (bool, error) {
+	f.setStickerPositionCalled = true
+	f.setStickerPositionLocationKey = stickerLocationKey
+	f.setStickerPosition = position
+	if f.setStickerPositionErr != nil {
+		return false, f.setStickerPositionErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPISetStickerSetTitle(_ context.Context, _ int64, name, title string) (bool, error) {
+	f.setStickerSetTitleCalled = true
+	f.setStickerSetTitleName = name
+	f.setStickerSetTitleValue = title
+	if f.setStickerSetTitleErr != nil {
+		return false, f.setStickerSetTitleErr
+	}
+	return true, nil
+}
+
+func (f *fakeBotAPIGateway) BotAPIDeleteStickerSet(_ context.Context, _ int64, name string) (bool, error) {
+	f.deleteStickerSetCalled = true
+	f.deleteStickerSetName = name
+	if f.deleteStickerSetErr != nil {
+		return false, f.deleteStickerSetErr
+	}
+	return true, nil
 }
 
 func (f *fakeBotAPIGateway) BotAPIGiftPremiumSubscription(

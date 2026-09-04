@@ -91,6 +91,15 @@ type GatewayService interface {
 	BotAPICloseForumTopic(ctx context.Context, botID, chatID int64, topicID int) (bool, error)
 	BotAPIReopenForumTopic(ctx context.Context, botID, chatID int64, topicID int) (bool, error)
 	BotAPIDeleteForumTopic(ctx context.Context, botID, chatID int64, topicID int) (bool, error)
+	// Sticker set family.
+	BotAPIGetStickerSet(ctx context.Context, botID int64, name string) (domain.StickerSet, []domain.Document, error)
+	BotAPIUploadStickerFile(ctx context.Context, botID int64, fileBytes []byte, fileName, mimeType string) (domain.Document, error)
+	BotAPICreateNewStickerSet(ctx context.Context, botID, ownerUserID int64, name, title, stickerType string, stickers []domain.BotAPIInputSticker) (bool, error)
+	BotAPIAddStickerToSet(ctx context.Context, botID, ownerUserID int64, name string, sticker domain.BotAPIInputSticker) (bool, error)
+	BotAPIDeleteStickerFromSet(ctx context.Context, botID int64, stickerLocationKey string) (bool, error)
+	BotAPISetStickerPositionInSet(ctx context.Context, botID int64, stickerLocationKey string, position int) (bool, error)
+	BotAPISetStickerSetTitle(ctx context.Context, botID int64, name, title string) (bool, error)
+	BotAPIDeleteStickerSet(ctx context.Context, botID int64, name string) (bool, error)
 }
 
 type EphemeralGatewayService interface {
@@ -346,6 +355,22 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.reopenForumTopic(w, r, botID)
 	case "deleteforumtopic":
 		h.deleteForumTopic(w, r, botID)
+	case "getstickerset":
+		h.getStickerSet(w, r, botID)
+	case "uploadstickerfile":
+		h.uploadStickerFile(w, r, botID)
+	case "createnewstickerset":
+		h.createNewStickerSet(w, r, botID)
+	case "addstickertoset":
+		h.addStickerToSet(w, r, botID)
+	case "deletestickerfromset":
+		h.deleteStickerFromSet(w, r, botID)
+	case "setstickerpositioninset":
+		h.setStickerPositionInSet(w, r, botID)
+	case "setstickersettitle":
+		h.setStickerSetTitle(w, r, botID)
+	case "deletestickerset":
+		h.deleteStickerSet(w, r, botID)
 	case "editmessagetext":
 		h.editMessageText(w, r, botID)
 	case "deletemessage":
@@ -1704,6 +1729,12 @@ func apiErrorDescription(err error) string {
 		"TOPIC_TITLE_EMPTY",
 		"LIMIT_INVALID",
 		"CHAT_NOT_MODIFIED",
+		"STICKERSET_INVALID",
+		"STICKER_TYPE_INVALID",
+		"STICKERS_EMPTY",
+		"STICKER_POSITION_INVALID",
+		"SHORT_NAME_INVALID",
+		"SHORT_NAME_OCCUPIED",
 	} {
 		if strings.Contains(text, marker) {
 			return marker

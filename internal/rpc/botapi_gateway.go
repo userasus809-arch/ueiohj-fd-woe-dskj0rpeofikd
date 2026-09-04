@@ -2005,3 +2005,281 @@ func (r *Router) BotAPIDeleteForumTopic(ctx context.Context, botID, chatID int64
 	}
 	return true, nil
 }
+
+func botAPIStickerSetKindFromType(stickerType string) (domain.StickerSetKind, bool) {
+	switch stickerType {
+	case "", "regular":
+		return domain.StickerSetKindStickers, true
+	case "mask":
+		return domain.StickerSetKindMasks, true
+	case "custom_emoji":
+		return domain.StickerSetKindEmoji, true
+	default:
+		return "", false
+	}
+}
+
+// botAPIResolveStickerInput turns one createNewStickerSet/addStickerToSet
+// sticker entry into a stored Document (uploading fresh bytes, or looking
+// up an already-uploaded one by its decoded file_id), matching how
+// botAPIMedia resolves "document"-kind message media.
+func (r *Router) botAPIResolveStickerInput(ctx context.Context, input domain.BotAPIInputSticker) (domain.Document, error) {
+	switch {
+	case len(input.FileBytes) > 0:
+		doc, err := r.deps.Files.CreateDocumentFromBytes(ctx, input.FileBytes, domain.DocumentSpec{
+			MimeType:   input.MimeType,
+			Attributes: botAPIDocumentAttributes(input.FileName),
+		})
+		if err != nil {
+			return domain.Document{}, botAPIMediaErr(err)
+		}
+		return doc, nil
+	case input.LocationKey != "":
+		id, ok := botAPIDocumentID(input.LocationKey)
+		if !ok {
+			return domain.Document{}, errors.New("FILE_ID_INVALID")
+		}
+		doc, found, err := r.deps.Files.GetDocument(ctx, id)
+		if err != nil {
+			return domain.Document{}, err
+		}
+		if !found {
+			return domain.Document{}, errors.New("FILE_ID_INVALID")
+		}
+		return doc, nil
+	default:
+		return domain.Document{}, errors.New("FILE_ID_INVALID")
+	}
+}
+
+// BotAPIGetStickerSet backs the getStickerSet method.
+func (r *Router) BotAPIGetStickerSet(ctx context.Context, botID int64, name string) (domain.StickerSet, []domain.Document, error) {
+	if r == nil || r.deps.Files == nil || botID == 0 {
+		return domain.StickerSet{}, nil, errors.New("BOT_INVALID")
+	}
+	set, docs, found, err := r.deps.Files.ResolveStickerSet(ctx, domain.StickerSetRef{
+		Kind:      domain.StickerSetRefByShortName,
+		ShortName: name,
+	})
+	if err != nil {
+		return domain.StickerSet{}, nil, err
+	}
+	if !found {
+		return domain.StickerSet{}, nil, errors.New("STICKERSET_INVALID")
+	}
+	return set, docs, nil
+}
+
+// BotAPIUploadStickerFile backs the uploadStickerFile method: it stores the
+// upload as a Document without attaching it to any set, matching the
+// official method's "for later use" contract.
+func (r *Router) BotAPIUploadStickerFile(ctx context.Context, botID int64, fileBytes []byte, fileName, mimeType string) (domain.Document, error) {
+	if r == nil || r.deps.Files == nil || botID == 0 {
+		return domain.Document{}, errors.New("BOT_INVALID")
+	}
+	if len(fileBytes) == 0 {
+		return domain.Document{}, errors.New("FILE_ID_INVALID")
+	}
+	doc, err := r.deps.Files.CreateDocumentFromBytes(ctx, fileBytes, domain.DocumentSpec{
+		MimeType:   mimeType,
+		Attributes: botAPIDocumentAttributes(fileName),
+	})
+	if err != nil {
+		return domain.Document{}, botAPIMediaErr(err)
+	}
+	return doc, nil
+}
+
+// BotAPICreateNewStickerSet backs the createNewStickerSet method, reusing
+// the same channels-free stickers.createStickerSet business logic (title/
+// short-name validation, dedupe, catalog invalidation) MTProto clients use.
+func (r *Router) BotAPICreateNewStickerSet(ctx context.Context, botID, ownerUserID int64, name, title, stickerType string, stickers []domain.BotAPIInputSticker) (bool, error) {
+	if r == nil || r.deps.Files == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	if ownerUserID <= 0 {
+		return false, errors.New("USER_ID_INVALID")
+	}
+	kind, ok := botAPIStickerSetKindFromType(stickerType)
+	if !ok {
+		return false, errors.New("STICKER_TYPE_INVALID")
+	}
+	if len(stickers) == 0 {
+		return false, errors.New("STICKERS_EMPTY")
+	}
+	items := make([]domain.StickerSetItemInput, 0, len(stickers))
+	for _, s := range stickers {
+		doc, err := r.botAPIResolveStickerInput(ctx, s)
+		if err != nil {
+			return false, err
+		}
+		items = append(items, domain.StickerSetItemInput{
+			DocumentID:         doc.ID,
+			DocumentAccessHash: doc.AccessHash,
+			Emoji:              s.Emoji,
+			Keywords:           s.Keywords,
+		})
+	}
+	if _, _, err := r.deps.Files.CreateStickerSet(ctx, domain.CreateStickerSetRequest{
+		CreatorUserID: ownerUserID,
+		Title:         title,
+		ShortName:     name,
+		Kind:          kind,
+		Items:         items,
+		Date:          int(r.clock.Now().Unix()),
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BotAPIAddStickerToSet backs the addStickerToSet method.
+func (r *Router) BotAPIAddStickerToSet(ctx context.Context, botID, ownerUserID int64, name string, sticker domain.BotAPIInputSticker) (bool, error) {
+	if r == nil || r.deps.Files == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	if ownerUserID <= 0 {
+		return false, errors.New("USER_ID_INVALID")
+	}
+	doc, err := r.botAPIResolveStickerInput(ctx, sticker)
+	if err != nil {
+		return false, err
+	}
+	if _, _, err := r.deps.Files.AddStickerToSet(ctx, ownerUserID, domain.StickerSetRef{
+		Kind:      domain.StickerSetRefByShortName,
+		ShortName: name,
+	}, domain.StickerSetItemInput{
+		DocumentID:         doc.ID,
+		DocumentAccessHash: doc.AccessHash,
+		Emoji:              sticker.Emoji,
+		Keywords:           sticker.Keywords,
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// botAPIStickerSetOwnerUserID looks up who owns a sticker set (its
+// CreatorUserID). The official deleteStickerFromSet/setStickerPositionInSet/
+// setStickerSetTitle/deleteStickerSet methods take no user_id/owner
+// parameter at all — Telegram lets whichever bot originally created the set
+// manage it. Since this deployment's ownership check is keyed on the
+// creating user id (set at createNewStickerSet time via its required
+// user_id param, not the bot's own id), these methods resolve the set
+// first and act as its recorded owner rather than as the bot.
+func (r *Router) botAPIStickerSetOwnerUserID(ctx context.Context, ref domain.StickerSetRef) (int64, error) {
+	set, _, found, err := r.deps.Files.ResolveStickerSet(ctx, ref)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, errors.New("STICKERSET_INVALID")
+	}
+	return set.CreatorUserID, nil
+}
+
+// BotAPIDeleteStickerFromSet backs the deleteStickerFromSet method.
+func (r *Router) BotAPIDeleteStickerFromSet(ctx context.Context, botID int64, stickerLocationKey string) (bool, error) {
+	if r == nil || r.deps.Files == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	id, ok := botAPIDocumentID(stickerLocationKey)
+	if !ok {
+		return false, errors.New("FILE_ID_INVALID")
+	}
+	doc, found, err := r.deps.Files.GetDocument(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, errors.New("FILE_ID_INVALID")
+	}
+	setID, setAccessHash := botAPIStickerSetIDFromDocument(doc)
+	if setID == 0 {
+		return false, errors.New("STICKERSET_INVALID")
+	}
+	ownerUserID, err := r.botAPIStickerSetOwnerUserID(ctx, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: setID, AccessHash: setAccessHash})
+	if err != nil {
+		return false, err
+	}
+	if _, _, err := r.deps.Files.RemoveStickerFromSet(ctx, ownerUserID, doc.ID, doc.AccessHash); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BotAPISetStickerPositionInSet backs the setStickerPositionInSet method.
+func (r *Router) BotAPISetStickerPositionInSet(ctx context.Context, botID int64, stickerLocationKey string, position int) (bool, error) {
+	if r == nil || r.deps.Files == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	id, ok := botAPIDocumentID(stickerLocationKey)
+	if !ok {
+		return false, errors.New("FILE_ID_INVALID")
+	}
+	doc, found, err := r.deps.Files.GetDocument(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, errors.New("FILE_ID_INVALID")
+	}
+	if position < 0 {
+		return false, errors.New("STICKER_POSITION_INVALID")
+	}
+	setID, setAccessHash := botAPIStickerSetIDFromDocument(doc)
+	if setID == 0 {
+		return false, errors.New("STICKERSET_INVALID")
+	}
+	ownerUserID, err := r.botAPIStickerSetOwnerUserID(ctx, domain.StickerSetRef{Kind: domain.StickerSetRefByID, ID: setID, AccessHash: setAccessHash})
+	if err != nil {
+		return false, err
+	}
+	if _, _, err := r.deps.Files.ChangeStickerPosition(ctx, ownerUserID, doc.ID, doc.AccessHash, position); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BotAPISetStickerSetTitle backs the setStickerSetTitle method.
+func (r *Router) BotAPISetStickerSetTitle(ctx context.Context, botID int64, name, title string) (bool, error) {
+	if r == nil || r.deps.Files == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	ref := domain.StickerSetRef{Kind: domain.StickerSetRefByShortName, ShortName: name}
+	ownerUserID, err := r.botAPIStickerSetOwnerUserID(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	if _, _, err := r.deps.Files.RenameStickerSet(ctx, ownerUserID, ref, title); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BotAPIDeleteStickerSet backs the deleteStickerSet method.
+func (r *Router) BotAPIDeleteStickerSet(ctx context.Context, botID int64, name string) (bool, error) {
+	if r == nil || r.deps.Files == nil || botID == 0 {
+		return false, errors.New("BOT_INVALID")
+	}
+	ref := domain.StickerSetRef{Kind: domain.StickerSetRefByShortName, ShortName: name}
+	ownerUserID, err := r.botAPIStickerSetOwnerUserID(ctx, ref)
+	if err != nil {
+		return false, err
+	}
+	if _, err := r.deps.Files.DeleteStickerSet(ctx, ownerUserID, ref); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// botAPIStickerSetIDFromDocument extracts the owning sticker set's id/access
+// hash from a document's sticker attribute.
+func botAPIStickerSetIDFromDocument(doc domain.Document) (int64, int64) {
+	for _, attr := range doc.Attributes {
+		if attr.Kind == domain.DocAttrSticker && attr.StickerSetID != 0 {
+			return attr.StickerSetID, attr.StickerSetAccessHash
+		}
+	}
+	return 0, 0
+}
