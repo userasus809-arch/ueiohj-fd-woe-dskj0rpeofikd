@@ -1600,6 +1600,7 @@ func run(logger *zap.Logger) error {
 		Metrics:                    metricRegistry,
 		Inline:                     inlineRegistryStore,
 		Limiter:                    rateLimiter,
+		Ads:                        adsService,
 	}, logger.Named("rpc"), clock.System)
 	readModelListener := postgres.NewReadModelChangeListener(cfg.PostgresDSN, postgres.ReadModelCacheSet{
 		ReadModelVersions:   readModelVersionStore,
@@ -1648,7 +1649,6 @@ func run(logger *zap.Logger) error {
 		GiftGranter:            router,
 		Bots:                   botsService,
 		Broadcast:              broadcastService,
-		Ads:                    adsService,
 		Emoji:                  filesService,
 		StickerSets:            filesService,
 		GifCatalog:             filesService,
